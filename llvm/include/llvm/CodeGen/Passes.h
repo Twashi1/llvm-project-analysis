@@ -42,6 +42,9 @@ class FileSystem;
 // List of target independent CodeGen pass IDs.
 namespace llvm {
 
+// FunctionPass *createRegisterAccessPostRAPass();
+// FunctionPass *createRegisterAccessPreRAPass();
+
 /// AtomicExpandPass - At IR level this pass replace atomic instructions with
 /// __atomic_* library calls, or target specific instruction which implement the
 /// same semantics in a way which better fits the target backend.

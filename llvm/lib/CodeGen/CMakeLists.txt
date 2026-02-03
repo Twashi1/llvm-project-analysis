@@ -22,6 +22,10 @@ if (DEFINED LLVM_HAVE_TF_AOT OR LLVM_HAVE_TFLITE)
   endif()
 endif()
 
+# TODO: terrible!
+set(XRAY_LIB "${CMAKE_BINARY_DIR}/lib/clang/21/lib/x86_64-unknown-linux-gnu/libclang_rt.xray.a")
+list(APPEND MLLinkDeps ${XRAY_LIB})
+
 add_llvm_component_library(LLVMCodeGen
   AggressiveAntiDepBreaker.cpp
   AllocationOrder.cpp
@@ -255,6 +259,10 @@ add_llvm_component_library(LLVMCodeGen
   XRayInstrumentation.cpp
   ${GeneratedMLSources}
 
+  # Maybe move?
+  RegisterAccessPostRA/RegisterAccessPostRAPass.cpp
+  RegisterAccessPreRA/RegisterAccessPreRAPass.cpp
+
   LiveDebugValues/LiveDebugValues.cpp
   LiveDebugValues/VarLocBasedImpl.cpp
   LiveDebugValues/InstrRefBasedImpl.cpp
@@ -287,6 +295,9 @@ add_llvm_component_library(LLVMCodeGen
   TransformUtils
   )
 
+message(STATUS "File is being read")
+
+# add_subdirectory(RegisterAccessPostRA)
 add_subdirectory(SelectionDAG)
 add_subdirectory(AsmPrinter)
 add_subdirectory(MIRParser)
