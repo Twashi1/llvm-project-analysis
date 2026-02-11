@@ -1218,10 +1218,13 @@ bool extIsProbablyIntegerInstruction(const MachineInstr &MI,
   StringRef Name = TII->getName(MI.getOpcode());
 
   static const char *IntPrefixes[] = {
-      "ADD", "SUB", "MUL", "IMUL", "DIV",   "IDIV",  "INC", "DEC",
-      "NEG", "AND", "OR",  "XOR",  "NOT",   "SHL",   "SAL", "SHR",
-      "SAR", "ROL", "ROR", "MOV",  "MOVSX", "MOVZX", "CMP", "TEST",
-      "BSF", "BSR", "BT",  "BTS",  "BTR",   "BTC"};
+      "ADD",    "ADC",   "SUB",   "SBB",    "MUL",  "IMUL",  "MULX", "DIV",
+      "IDIV",   "INC",   "DEC",   "NEG",    "AND",  "OR",    "XOR",  "NOT",
+      "SHL",    "SAL",   "SHR",   "SAR",    "ROL",  "ROR",   "RCL",  "RCR",
+      "MOV",    "MOVSX", "MOVZX", "MOVSXD", "XCHG", "CMP",   "TEST", "LEA",
+      "SET",    "CMOV",  "BSF",   "BSR",    "BT",   "BTS",   "BTR",  "BTC",
+      "POPCNT", "LZCNT", "TZCNT", "BSWAP",  "ANDN", "BEXTR", "BLSI", "BLSMSK",
+      "BLSR",   "PEXT",  "PDEP",  "SHLX",   "SHRX", "SARX"};
 
   for (const char *Prefix : IntPrefixes)
     if (Name.starts_with(StringRef(Prefix))) {
@@ -1269,9 +1272,18 @@ bool extIsProbablyFloatReg(StringRef R) {
 }
 
 bool extIsProbablyIALU(StringRef N) {
-  static const char *IALUPrefixes[] = {"ADD", "SUB", "INC", "DEC",
-                                       "AND", "XOR", "OR",  "SAR",
-                                       "SHR", "SHL", "CMP", "TEST"};
+  static const char *IALUPrefixes[] = {
+      "ADD",  "ADC",    "SUB",   "SBB",   "MUL",   "IMUL", "MULX", "DIV",
+      "IDIV", "INC",    "DEC",   "NEG",   "AND",   "OR",   "XOR",  "NOT",
+      "SHL",  "SAL",    "SHR",   "SAR",   "ROL",   "ROR",  "RCL",  "RCR",
+      "CMP",  "TEST",   "LEA",   "BSF",   "BSR",   "BT",   "BTS",  "BTR",
+      "BTC",  "POPCNT", "LZCNT", "TZCNT", "BSWAP", "CMOV"};
+
+  for (const char *Prefix : IALUPrefixes) {
+    if (N.starts_with_insensitive(StringRef(Prefix))) {
+      return true;
+    }
+  }
 
   return false;
 }
