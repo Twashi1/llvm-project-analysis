@@ -114,6 +114,8 @@ struct ExtPathCollector {
   std::vector<std::vector<unsigned>> DisjointSubgraphBlocks;
   std::vector<std::vector<unsigned>> PotentialStartBlocks;
   std::vector<std::vector<unsigned>> PotentialExitBlocks;
+  std::vector<std::vector<unsigned>> SubgraphInternalEndBlocks;
+  std::vector<int> SubgraphRoots;
 
   void addMachineFunctionEdge(const std::string &Caller,
                               unsigned LocalCallerBlock,

@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <deque>
+#include <filesystem>
+#include <ios>
 #include <iterator>
 #include <stack>
 #include <unordered_map>
@@ -370,7 +372,6 @@ void ExtPathCollector::buildCriticalPath() {
   //    - add entire sub-tree
   std::vector<std::vector<int>> AllSubgraphs;
   std::vector<std::vector<int>> SCCsInSubgraph;
-  std::vector<int> SubgraphRoots;
   std::vector<std::vector<int>> SubgraphLeaves;
 
   // While all nodes are not in a sub-graph
@@ -480,6 +481,7 @@ void ExtPathCollector::buildCriticalPath() {
     std::vector<unsigned> SubgraphBlocksSet;
     std::vector<unsigned> StartBlocks;
     std::vector<unsigned> EndBlocks;
+    std::vector<unsigned> InternalEndBlocks;
     // Index by SCC
     std::vector<uint8_t> IsSCCInSubgraph = std::vector<uint8_t>(CompCount, 0);
     int StartSCC = SubgraphRoots[i];
@@ -514,6 +516,7 @@ void ExtPathCollector::buildCriticalPath() {
           // possible So instead, we have to consider every child and add an
           // exit at that child
           EndBlocks.push_back(Successor);
+          InternalEndBlocks.push_back(BlockID);
         }
 
         if (!IsSCCInSubgraph[BlockSCC] && SCCOfSuccessor == StartSCC) {
@@ -534,6 +537,7 @@ void ExtPathCollector::buildCriticalPath() {
     SubgraphMBBList.push_back(SubgraphBlocksSet);
     PotentialStartBlocks.push_back(StartBlocks);
     PotentialExitBlocks.push_back(EndBlocks);
+    SubgraphInternalEndBlocks.push_back(InternalEndBlocks);
   }
 
   DisjointSubgraphBlocks = SubgraphMBBList;
@@ -641,6 +645,7 @@ void ExtPathCollector::outputCriticalPath() {
   std::error_code EC_TopoComp;
   std::error_code EC_BlockAdditional;
   std::error_code EC_MBBStats;
+  std::error_code EC_PathCFG;
 
   raw_fd_ostream OutDAGFile("DAG.csv", EC_DAG, sys::fs::OF_Append);
 
@@ -671,6 +676,13 @@ void ExtPathCollector::outputCriticalPath() {
     return;
   }
 
+  raw_fd_ostream OutPathCFG("PathCFG.csv", EC_PathCFG, sys::fs::OF_Append);
+
+  if (EC_PathCFG) {
+    errs() << "Error opening file: " << EC_PathCFG.message() << "\n";
+    return;
+  }
+
   // TODO: required CFG data
   //    1. we want to output the full DAG
   //    2. the list of basic block IDs for every component in DAG
@@ -687,6 +699,12 @@ void ExtPathCollector::outputCriticalPath() {
   // 2. create CFG.csv data format as follows
   // start_function_name,start_block_name,start_block_id,exit_function_name,exit_block_name,exit_block_id,branch_prob,start_path_index,end_path_index,is_start_entry
   OutCFGFile
+      << "module_name,start_function_name,start_block_name,start_block_id,exit_"
+         "function_"
+         "name,exit_block_name,exit_block_id,branch_prob,start_path_index,end_"
+         "path_index,is_start_entry\n";
+
+  OutPathCFG
       << "module_name,start_function_name,start_block_name,start_block_id,exit_"
          "function_"
          "name,exit_block_name,exit_block_id,branch_prob,start_path_index,end_"
@@ -931,6 +949,72 @@ void ExtPathCollector::outputCriticalPath() {
             << IntRegfileWrites << "," << FloatRegfileWrites << "\n";
   }
 
+  // TODO: write path CFG, a CFG related strictly to our program paths
+  // Cache for the total execution cycles of a given subgraph
+  std::vector<float> SubgraphExitExecutionFrequency = {};
+  for (unsigned i = 0; i < SubgraphInternalEndBlocks.size(); i++) {
+    std::vector<unsigned> const &InternalEndBlocks =
+        SubgraphInternalEndBlocks[i];
+
+    float TotalExecutionFrequency = 0.0;
+
+    for (unsigned u = 0; u < InternalEndBlocks.size(); u++) {
+      ExtBBStats stats = BlockStats[u];
+
+      TotalExecutionFrequency += stats.Freq;
+    }
+
+    SubgraphExitExecutionFrequency.push_back(TotalExecutionFrequency);
+  }
+
+  // 1. calculate total execution frequency of all exit blocks for a given entry
+  // block
+  // 2. assume singular entry block for a given subgraph
+  // 3. create a connection from the entry block to the exit block; if the exit
+  // block is within the subgraph
+  //    take the root of that subgraph to be the exit block
+  // 4. consider execution frequency of the exit block to be the weight, take it
+  // over our total weight to find probability
+  // Need mapping BlockID -> Subgraph (PathIndexOfBlock)
+  for (unsigned u = 0; u < GlobalAdjacencyList.size(); u++) {
+    std::vector<unsigned> const &Neighbours = GlobalAdjacencyList[u];
+    unsigned StartBlock = u;
+    ExtBBStats StartStats = BlockStats[StartBlock];
+
+    int StartSubgraphID = PathIndexOfBlock[u];
+
+    for (unsigned v = 0; v < Neighbours.size(); v++) {
+      unsigned EndBlock = Neighbours[v];
+      ExtBBStats EndStats = BlockStats[EndBlock];
+
+      int EndSubgraphID = PathIndexOfBlock[u];
+
+      if (StartSubgraphID == EndSubgraphID)
+        continue;
+
+      // Create connection not between the blocks, but between their roots
+      unsigned StartBlockRoot = SubgraphRoots[StartSubgraphID];
+      unsigned EndBlockRoot = SubgraphRoots[EndSubgraphID];
+
+      ExtBBStats StartRootStats = BlockStats[StartBlockRoot];
+      ExtBBStats EndRootStats = BlockStats[EndBlockRoot];
+
+      // We take the probability of thsi connection to be our execution
+      // frequency relative to the execution frequency of all exit blocks summed
+      // Poor accuracy likely, but a simple heuristic to use
+      float EdgeProbability = EndStats.Freq / SubgraphExitExecutionFrequency[u];
+
+      // print to CFG data in format
+      OutPathCFG << StartRootStats.ModuleName << ","
+                 << StartRootStats.FunctionName << "," << StartRootStats.Name
+                 << "," << StartBlockRoot << "," << EndRootStats.FunctionName
+                 << "," << EndRootStats.Name << "," << EndBlockRoot << ","
+                 << EdgeProbability << "," << PathIndexOfBlock[StartBlockRoot]
+                 << "," << PathIndexOfBlock[EndBlockRoot] << ","
+                 << MapIsEntryBlock[StartBlockRoot] << "\n";
+    }
+  }
+
   // Write full CFG data to CFG.csv
   // start_function_name,start_block_name,start_block_id,exit_function_name,exit_block_name,exit_block_id,branch_prob,start_path_index,end_path_index,is_start_entry
   for (unsigned u = 0; u < GlobalAdjacencyList.size(); u++) {
@@ -1068,6 +1152,7 @@ void ExtPathCollector::outputCriticalPath() {
   OutBlockAdditional.close();
   OutTopoComp.close();
   OutDAGFile.close();
+  OutPathCFG.close();
   OutMBB.close();
 }
 

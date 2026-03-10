@@ -23,8 +23,8 @@ if (DEFINED LLVM_HAVE_TF_AOT OR LLVM_HAVE_TFLITE)
 endif()
 
 # TODO: terrible!
-set(XRAY_LIB "${CMAKE_BINARY_DIR}/lib/clang/21/lib/x86_64-unknown-linux-gnu/libclang_rt.xray.a")
-list(APPEND MLLinkDeps ${XRAY_LIB})
+# set(XRAY_LIB "${CMAKE_BINARY_DIR}/lib/clang/21/lib/x86_64-unknown-linux-gnu/libclang_rt.xray.a")
+# list(APPEND MLLinkDeps ${XRAY_LIB})
 
 add_llvm_component_library(LLVMCodeGen
   AggressiveAntiDepBreaker.cpp
