@@ -958,7 +958,7 @@ void ExtPathCollector::outputCriticalPath() {
     float TotalExecutionFrequency = 0.0;
 
     for (unsigned u = 0; u < SubgraphExitBlocks.size(); u++) {
-      unsigned BlockID = InternalEndBlocks[u];
+      unsigned BlockID = SubgraphExitBlocks[u];
       ExtBBStats Stats = BlockStats[BlockID];
 
       TotalExecutionFrequency += Stats.Freq;
