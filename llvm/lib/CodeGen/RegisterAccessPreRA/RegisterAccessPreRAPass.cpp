@@ -952,16 +952,16 @@ void ExtPathCollector::outputCriticalPath() {
   // TODO: write path CFG, a CFG related strictly to our program paths
   // Cache for the total execution cycles of a given subgraph
   std::vector<float> SubgraphExitExecutionFrequency = {};
-  for (unsigned i = 0; i < SubgraphInternalEndBlocks.size(); i++) {
-    std::vector<unsigned> const &InternalEndBlocks =
-        SubgraphInternalEndBlocks[i];
+  for (unsigned i = 0; i < PotentialExitBlocks.size(); i++) {
+    std::vector<unsigned> const &SubgraphExitBlocks = PotentialExitBlocks[i];
 
     float TotalExecutionFrequency = 0.0;
 
-    for (unsigned u = 0; u < InternalEndBlocks.size(); u++) {
-      ExtBBStats stats = BlockStats[u];
+    for (unsigned u = 0; u < SubgraphExitBlocks.size(); u++) {
+      unsigned BlockID = InternalEndBlocks[u];
+      ExtBBStats Stats = BlockStats[BlockID];
 
-      TotalExecutionFrequency += stats.Freq;
+      TotalExecutionFrequency += Stats.Freq;
     }
 
     SubgraphExitExecutionFrequency.push_back(TotalExecutionFrequency);
@@ -976,21 +976,33 @@ void ExtPathCollector::outputCriticalPath() {
   // 4. consider execution frequency of the exit block to be the weight, take it
   // over our total weight to find probability
   // Need mapping BlockID -> Subgraph (PathIndexOfBlock)
+  // // TODO: code is not running? Not outputtig?
   for (unsigned u = 0; u < GlobalAdjacencyList.size(); u++) {
     std::vector<unsigned> const &Neighbours = GlobalAdjacencyList[u];
     unsigned StartBlock = u;
     ExtBBStats StartStats = BlockStats[StartBlock];
 
-    int StartSubgraphID = PathIndexOfBlock[u];
+    LLVM_DEBUG(dbgs() << "Start subgraph, getting path index of block: "
+                      << StartBlock << " note size is "
+                      << PathIndexOfBlock.size() << "\n");
+    int StartSubgraphID = PathIndexOfBlock[StartBlock];
 
     for (unsigned v = 0; v < Neighbours.size(); v++) {
       unsigned EndBlock = Neighbours[v];
       ExtBBStats EndStats = BlockStats[EndBlock];
 
-      int EndSubgraphID = PathIndexOfBlock[u];
+      LLVM_DEBUG(dbgs() << "End subgraph, getting path index of block: "
+                        << EndBlock << " note size is "
+                        << PathIndexOfBlock.size() << "\n");
+
+      int EndSubgraphID = PathIndexOfBlock[EndBlock];
 
       if (StartSubgraphID == EndSubgraphID)
         continue;
+
+      LLVM_DEBUG(dbgs() << "Subgraph roots: " << SubgraphRoots.size() << "\n");
+      LLVM_DEBUG(dbgs() << "Start roots: " << StartSubgraphID << "\n");
+      LLVM_DEBUG(dbgs() << "End roots: " << EndSubgraphID << "\n");
 
       // Create connection not between the blocks, but between their roots
       unsigned StartBlockRoot = SubgraphRoots[StartSubgraphID];
@@ -999,10 +1011,20 @@ void ExtPathCollector::outputCriticalPath() {
       ExtBBStats StartRootStats = BlockStats[StartBlockRoot];
       ExtBBStats EndRootStats = BlockStats[EndBlockRoot];
 
+      LLVM_DEBUG(dbgs() << "Subgraph exit execution frequency: "
+                        << SubgraphExitExecutionFrequency.size() << "\n");
+      LLVM_DEBUG(dbgs() << "Index: " << StartBlock << "\n");
+
       // We take the probability of thsi connection to be our execution
       // frequency relative to the execution frequency of all exit blocks summed
       // Poor accuracy likely, but a simple heuristic to use
-      float EdgeProbability = EndStats.Freq / SubgraphExitExecutionFrequency[u];
+      float SubgraphExecutionFrequency =
+          SubgraphExitExecutionFrequency[StartSubgraphID];
+      float EdgeProbability = 1.0;
+
+      if (SubgraphExecutionFrequency > 0.0) {
+        EdgeProbability = EndStats.Freq / SubgraphExecutionFrequency;
+      }
 
       // print to CFG data in format
       OutPathCFG << StartRootStats.ModuleName << ","
