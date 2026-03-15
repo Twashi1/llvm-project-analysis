@@ -621,13 +621,13 @@ std::vector<ExtBBStats> extProfileToBBStats(StringRef fileName) {
 }
 
 void ExtPathCollector::outputCriticalPath() {
-  // TODO: function is poorly named, there are multiple critical paths
-  // TODO: not even critical paths anymore, DVS calling points instead
-  std::error_code EC;
-  raw_fd_ostream OutFile("CritPath.csv", EC, sys::fs::OF_Append);
+  std::error_code EC_PathRoots;
+  raw_fd_ostream OutPathRoots("PathRoots.csv", EC_PathRoots,
+                              sys::fs::OF_Append);
 
-  if (EC) {
-    errs() << "Error opening file: " << EC.message() << "\n";
+  // TODO: function for checking error code?
+  if (EC_PathRoots) {
+    errs() << "Error opening file: " << EC_PathRoots.message() << "\n";
     return;
   }
 
@@ -710,6 +710,8 @@ void ExtPathCollector::outputCriticalPath() {
          "name,exit_block_name,exit_block_id,branch_prob,start_path_index,end_"
          "path_index,is_start_entry\n";
 
+  OutPathRoots << "module_name,path_index,block_id\n";
+
   OutDAGFile << "module_name,start_comp,end_comp\n";
   OutTopoComp << "module_name,comp_id,comp_priority\n";
   OutBlockAdditional << "module_name,block_id,comp_id,execution_cycles\n";
@@ -723,15 +725,6 @@ void ExtPathCollector::outputCriticalPath() {
     errs() << "Error opening file: " << EC3.message() << "\n";
     return;
   }
-
-  // TODO: this is unused
-  // NOTE: both freq and global_freq lose meaning when summed across blocks
-  OutFile
-      << "module_name,function_name,start_block,end_func,end_block,cycle_count,"
-         "writes,reads,loads,stores,instr_count,freq,global_freq,int_instr_"
-         "count,float_instr_count,branch_instr_count,loadstore_instr,function_"
-         "calls,context_switches,mul_access,fp_access,ialu_access,int_regfile_"
-         "reads,float_regfile_reads,int_regfile_writes,float_regfile_writes\n";
 
   BlockOutFile
       << "module_name,path_index,function_name,block_name,is_entry,is_exit,"
@@ -937,16 +930,6 @@ void ExtPathCollector::outputCriticalPath() {
     if (Cycles < 1e6) {
       // continue;
     }
-
-    OutFile << ModuleName << "," << StartBlockFunc << "," << StartBlockName
-            << "," << EndBlockFunc << "," << EndBlockName << "," << Cycles
-            << "," << Writes << "," << Reads << "," << Loads << "," << Stores
-            << "," << Instrs << "," << Freq << "," << GlobalFreq << ","
-            << IntInstrs << "," << FloatInstrs << "," << BranchInstrs << ","
-            << LoadStoreInstrs << "," << FunctionCalls << "," << ContextSwitches
-            << "," << MulAccess << "," << FPAccess << "," << IntALUAccess << ","
-            << IntRegfileReads << "," << FloatRegfileReads << ","
-            << IntRegfileWrites << "," << FloatRegfileWrites << "\n";
   }
 
   // TODO: write path CFG, a CFG related strictly to our program paths
@@ -982,38 +965,16 @@ void ExtPathCollector::outputCriticalPath() {
     unsigned StartBlock = u;
     ExtBBStats StartStats = BlockStats[StartBlock];
 
-    LLVM_DEBUG(dbgs() << "Start subgraph, getting path index of block: "
-                      << StartBlock << " note size is "
-                      << PathIndexOfBlock.size() << "\n");
     int StartSubgraphID = PathIndexOfBlock[StartBlock];
 
     for (unsigned v = 0; v < Neighbours.size(); v++) {
       unsigned EndBlock = Neighbours[v];
       ExtBBStats EndStats = BlockStats[EndBlock];
 
-      LLVM_DEBUG(dbgs() << "End subgraph, getting path index of block: "
-                        << EndBlock << " note size is "
-                        << PathIndexOfBlock.size() << "\n");
-
       int EndSubgraphID = PathIndexOfBlock[EndBlock];
 
       if (StartSubgraphID == EndSubgraphID)
         continue;
-
-      LLVM_DEBUG(dbgs() << "Subgraph roots: " << SubgraphRoots.size() << "\n");
-      LLVM_DEBUG(dbgs() << "Start roots: " << StartSubgraphID << "\n");
-      LLVM_DEBUG(dbgs() << "End roots: " << EndSubgraphID << "\n");
-
-      // Create connection not between the blocks, but between their roots
-      unsigned StartBlockRoot = SubgraphRoots[StartSubgraphID];
-      unsigned EndBlockRoot = SubgraphRoots[EndSubgraphID];
-
-      ExtBBStats StartRootStats = BlockStats[StartBlockRoot];
-      ExtBBStats EndRootStats = BlockStats[EndBlockRoot];
-
-      LLVM_DEBUG(dbgs() << "Subgraph exit execution frequency: "
-                        << SubgraphExitExecutionFrequency.size() << "\n");
-      LLVM_DEBUG(dbgs() << "Index: " << StartBlock << "\n");
 
       // We take the probability of thsi connection to be our execution
       // frequency relative to the execution frequency of all exit blocks summed
@@ -1027,13 +988,12 @@ void ExtPathCollector::outputCriticalPath() {
       }
 
       // print to CFG data in format
-      OutPathCFG << StartRootStats.ModuleName << ","
-                 << StartRootStats.FunctionName << "," << StartRootStats.Name
-                 << "," << StartBlockRoot << "," << EndRootStats.FunctionName
-                 << "," << EndRootStats.Name << "," << EndBlockRoot << ","
-                 << EdgeProbability << "," << PathIndexOfBlock[StartBlockRoot]
-                 << "," << PathIndexOfBlock[EndBlockRoot] << ","
-                 << MapIsEntryBlock[StartBlockRoot] << "\n";
+      OutPathCFG << StartStats.ModuleName << "," << StartStats.FunctionName
+                 << "," << StartStats.Name << "," << StartSubgraphID << ","
+                 << EndStats.FunctionName << "," << EndStats.Name << ","
+                 << EndSubgraphID << "," << EdgeProbability << ","
+                 << StartSubgraphID << "," << EndSubgraphID << ","
+                 << MapIsEntryBlock[StartBlock] << "\n";
     }
   }
 
@@ -1168,13 +1128,13 @@ void ExtPathCollector::outputCriticalPath() {
                       << ", stores: " << OutputStatsBB.Stores << "\n");
   }
 
-  OutFile.close();
   BlockOutFile.close();
   OutCFGFile.close();
   OutBlockAdditional.close();
   OutTopoComp.close();
   OutDAGFile.close();
   OutPathCFG.close();
+  OutPathRoots.close();
   OutMBB.close();
 }
 
