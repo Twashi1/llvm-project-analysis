@@ -20,8 +20,8 @@ namespace llvm {
 
 class PassRegistry;
 
-void initializeRegisterAccessPostRAPassPass(PassRegistry &);
 void initializeRegisterAccessPreRAPassPass(PassRegistry &);
+void initializeExtLoopSplittingPassPass(PassRegistry &);
 
 /// Initialize all passes linked into the Core library.
 LLVM_ABI void initializeCore(PassRegistry &);

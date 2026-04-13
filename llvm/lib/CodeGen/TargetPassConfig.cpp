@@ -17,6 +17,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/CallGraphSCCPass.h"
+#include "llvm/Analysis/ExtLoopSplittingPass.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
@@ -29,7 +30,6 @@
 #include "llvm/CodeGen/MachinePassRegistry.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
-#include "llvm/CodeGen/RegisterAccessPostRAPass.h"
 #include "llvm/CodeGen/RegisterAccessPreRAPass.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -853,6 +853,8 @@ void TargetPassConfig::addIRPasses() {
         addPass(createLoopTermFoldPass());
     }
 
+    addPass(createExtLoopSplittingPass());
+
     // The MergeICmpsPass tries to create memcmp calls by grouping sequences of
     // loads and compares. ExpandMemCmpPass then tries to expand those calls
     // into optimally-sized loads and compares. The transforms are enabled by a
@@ -1193,10 +1195,10 @@ void TargetPassConfig::addMachinePasses() {
     addMachineLateOptimization();
 
   // Added our own pass here
+  // TODO: experiment with scheduling pass just a bit later
   // NOTE: added an extra machine block pass, no idea if it will work
   // addPass(createMachineBlockFrequencyInfoPass());
   addPass(createRegisterAccessPreRAPass());
-  addPass(createRegisterAccessPostRAPass());
 
   // Expand pseudo instructions before second scheduling pass.
   addPass(&ExpandPostRAPseudosID);

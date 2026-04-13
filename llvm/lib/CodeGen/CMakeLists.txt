@@ -260,7 +260,6 @@ add_llvm_component_library(LLVMCodeGen
   ${GeneratedMLSources}
 
   # Maybe move?
-  RegisterAccessPostRA/RegisterAccessPostRAPass.cpp
   RegisterAccessPreRA/RegisterAccessPreRAPass.cpp
 
   LiveDebugValues/LiveDebugValues.cpp
