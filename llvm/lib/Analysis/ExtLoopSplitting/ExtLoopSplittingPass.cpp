@@ -108,6 +108,18 @@ bool extTileLoop(Loop *L, LoopInfo *LI, uint64_t tileConstant) {
 char ExtLoopSplittingPass::ID = 0;
 
 bool ExtLoopSplittingPass::runOnLoop(Loop *L, LPPassManager &LPM) {
+  LLVM_DEBUG(dbgs() << "[LoopSplittingPass] Running on loop: ");
+
+  BasicBlock *Header = L->getHeader();
+
+  if (Header && Header->hasName()) {
+    LLVM_DEBUG(dbgs() << Header->getName());
+  } else {
+    LLVM_DEBUG(dbgs() << "<unnamed>");
+  }
+
+  LLVM_DEBUG(dbgs() << "\n");
+
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
 

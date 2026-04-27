@@ -239,11 +239,16 @@ void ExtPathCollector::buildCriticalPath() {
     int c = CompIDs[v];
     // TODO: cost is not used anywhere
     CompCost[c] += BlockStats[v].Cycles;
+    // TODO: this is actually not correct, we should use Freq instead in reality
+    // although it doesn't matter too much
     // Note both cases we're using GlobalFreq, we want this to be irrespective
     // of the function's call frequency
     CompWeight[c] += BlockStats[v].Cycles * BlockStats[v].GlobalFreq;
+    // TODO: instead, only look at potential entry blocks within the component
+    // additionally, take the maximum of the entry blocks as its both the
+    // worst-case and average-case scenario
     CompMinFrequency[c] =
-        std::min(CompMinFrequency[c], BlockStats[v].GlobalFreq);
+        std::max(CompMinFrequency[c], BlockStats[v].GlobalFreq);
   }
 
   LLVM_DEBUG(dbgs() << "Computed costs, now finding DAG adjacency\n");
