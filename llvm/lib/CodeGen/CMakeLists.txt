@@ -261,6 +261,7 @@ add_llvm_component_library(LLVMCodeGen
 
   # Maybe move?
   RegisterAccessPreRA/RegisterAccessPreRAPass.cpp
+  ThermalScheduler.cpp
 
   LiveDebugValues/LiveDebugValues.cpp
   LiveDebugValues/VarLocBasedImpl.cpp
