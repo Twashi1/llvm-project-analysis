@@ -90,6 +90,9 @@ set(sources
   GISel/X86InstructionSelector.cpp
   GISel/X86LegalizerInfo.cpp
   GISel/X86RegisterBankInfo.cpp
+
+  # Marker pass
+  X86M5MarkerPass.cpp
   )
 
 add_llvm_target(X86CodeGen ${sources}

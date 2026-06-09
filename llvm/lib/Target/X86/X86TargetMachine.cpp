@@ -14,6 +14,7 @@
 #include "MCTargetDesc/X86MCTargetDesc.h"
 #include "TargetInfo/X86TargetInfo.h"
 #include "X86.h"
+#include "X86M5MarkerPass.h"
 #include "X86MachineFunctionInfo.h"
 #include "X86MacroFusion.h"
 #include "X86Subtarget.h"
@@ -54,9 +55,10 @@
 
 using namespace llvm;
 
-static cl::opt<bool> EnableMachineCombinerPass("x86-machine-combiner",
-                               cl::desc("Enable the machine combiner pass"),
-                               cl::init(true), cl::Hidden);
+static cl::opt<bool>
+    EnableMachineCombinerPass("x86-machine-combiner",
+                              cl::desc("Enable the machine combiner pass"),
+                              cl::init(true), cl::Hidden);
 
 static cl::opt<bool>
     EnableTileRAPass("x86-tile-ra",
@@ -410,7 +412,7 @@ namespace {
 class X86PassConfig : public TargetPassConfig {
 public:
   X86PassConfig(X86TargetMachine &TM, PassManagerBase &PM)
-    : TargetPassConfig(TM, PM) {}
+      : TargetPassConfig(TM, PM) {}
 
   X86TargetMachine &getX86TargetMachine() const {
     return getTM<X86TargetMachine>();
@@ -449,10 +451,10 @@ char X86ExecutionDomainFix::ID;
 } // end anonymous namespace
 
 INITIALIZE_PASS_BEGIN(X86ExecutionDomainFix, "x86-execution-domain-fix",
-  "X86 Execution Domain Fix", false, false)
+                      "X86 Execution Domain Fix", false, false)
 INITIALIZE_PASS_DEPENDENCY(ReachingDefAnalysis)
 INITIALIZE_PASS_END(X86ExecutionDomainFix, "x86-execution-domain-fix",
-  "X86 Execution Domain Fix", false, false)
+                    "X86 Execution Domain Fix", false, false)
 
 TargetPassConfig *X86TargetMachine::createPassConfig(PassManagerBase &PM) {
   return new X86PassConfig(*this, PM);
@@ -567,6 +569,10 @@ void X86PassConfig::addPreRegAlloc() {
   addPass(createX86FlagsCopyLoweringPass());
   addPass(createX86DynAllocaExpander());
 
+  // TODO: might be a better place; we create virtual register so must be before
+  // reg alloc Marker insertion pass
+  addPass(createX86M5MarkerPass());
+
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createX86PreTileConfigPass());
   else
@@ -611,6 +617,7 @@ void X86PassConfig::addPreEmitPass() {
     addPass(createX86FixupInstTuning());
     addPass(createX86FixupVectorConstants());
   }
+
   addPass(createX86CompressEVEXPass());
   addPass(createX86DiscriminateMemOpsPass());
   addPass(createX86InsertPrefetchPass());

@@ -144,38 +144,38 @@ void X86ExpandPseudo::expandICallBranchFunnel(
 
   std::function<void(unsigned, unsigned)> EmitBranchFunnel =
       [&](unsigned FirstTarget, unsigned NumTargets) {
-    if (NumTargets == 1) {
-      EmitTailCall(FirstTarget);
-      return;
-    }
+        if (NumTargets == 1) {
+          EmitTailCall(FirstTarget);
+          return;
+        }
 
-    if (NumTargets == 2) {
-      CmpTarget(FirstTarget + 1);
-      EmitCondJumpTarget(X86::COND_B, FirstTarget);
-      EmitTailCall(FirstTarget + 1);
-      return;
-    }
+        if (NumTargets == 2) {
+          CmpTarget(FirstTarget + 1);
+          EmitCondJumpTarget(X86::COND_B, FirstTarget);
+          EmitTailCall(FirstTarget + 1);
+          return;
+        }
 
-    if (NumTargets < 6) {
-      CmpTarget(FirstTarget + 1);
-      EmitCondJumpTarget(X86::COND_B, FirstTarget);
-      EmitCondJumpTarget(X86::COND_E, FirstTarget + 1);
-      EmitBranchFunnel(FirstTarget + 2, NumTargets - 2);
-      return;
-    }
+        if (NumTargets < 6) {
+          CmpTarget(FirstTarget + 1);
+          EmitCondJumpTarget(X86::COND_B, FirstTarget);
+          EmitCondJumpTarget(X86::COND_E, FirstTarget + 1);
+          EmitBranchFunnel(FirstTarget + 2, NumTargets - 2);
+          return;
+        }
 
-    auto *ThenMBB = CreateMBB();
-    CmpTarget(FirstTarget + (NumTargets / 2));
-    EmitCondJump(X86::COND_B, ThenMBB);
-    EmitCondJumpTarget(X86::COND_E, FirstTarget + (NumTargets / 2));
-    EmitBranchFunnel(FirstTarget + (NumTargets / 2) + 1,
-                  NumTargets - (NumTargets / 2) - 1);
+        auto *ThenMBB = CreateMBB();
+        CmpTarget(FirstTarget + (NumTargets / 2));
+        EmitCondJump(X86::COND_B, ThenMBB);
+        EmitCondJumpTarget(X86::COND_E, FirstTarget + (NumTargets / 2));
+        EmitBranchFunnel(FirstTarget + (NumTargets / 2) + 1,
+                         NumTargets - (NumTargets / 2) - 1);
 
-    MF->insert(InsPt, ThenMBB);
-    MBB = ThenMBB;
-    MBBI = MBB->end();
-    EmitBranchFunnel(FirstTarget, NumTargets / 2);
-  };
+        MF->insert(InsPt, ThenMBB);
+        MBB = ThenMBB;
+        MBBI = MBB->end();
+        EmitBranchFunnel(FirstTarget, NumTargets / 2);
+      };
 
   EmitBranchFunnel(0, (JTInst->getNumOperands() - 2) / 2);
   for (auto P : TargetMBBs) {
@@ -266,6 +266,16 @@ bool X86ExpandPseudo::expandMI(MachineBasicBlock &MBB,
   switch (Opcode) {
   default:
     return false;
+  // case X86::M5_MARKER: {
+  //   // const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+  //   Register IdReg = MI.getOperand(0).getReg();
+  //
+  //   BuildMI(MBB, MI, DL, TII->get(X86::COPY), X86::EDI).addReg(IdReg);
+  //   BuildMI(MBB, MI, DL, TII->get(X86::INLINEASM));
+  //
+  //   MI.eraseFromParent();
+  //   return true;
+  // }
   case X86::TCRETURNdi:
   case X86::TCRETURNdicc:
   case X86::TCRETURNri:
@@ -277,8 +287,8 @@ bool X86ExpandPseudo::expandMI(MachineBasicBlock &MBB,
   case X86::TCRETURNmi64: {
     bool isMem = Opcode == X86::TCRETURNmi || Opcode == X86::TCRETURNmi64;
     MachineOperand &JumpTarget = MBBI->getOperand(0);
-    MachineOperand &StackAdjust = MBBI->getOperand(isMem ? X86::AddrNumOperands
-                                                         : 1);
+    MachineOperand &StackAdjust =
+        MBBI->getOperand(isMem ? X86::AddrNumOperands : 1);
     assert(StackAdjust.isImm() && "Expecting immediate value.");
 
     // Adjust stack pointer.
@@ -355,8 +365,7 @@ bool X86ExpandPseudo::expandMI(MachineBasicBlock &MBB,
     } else {
       assert(!IsX64 && "Win64 and UEFI64 require REX for indirect jumps.");
       JumpTarget.setIsKill();
-      BuildMI(MBB, MBBI, DL, TII->get(X86::TAILJMPr))
-          .add(JumpTarget);
+      BuildMI(MBB, MBBI, DL, TII->get(X86::TAILJMPr)).add(JumpTarget);
     }
 
     MachineInstr &NewMI = *std::prev(MBBI);
@@ -415,7 +424,8 @@ bool X86ExpandPseudo::expandMI(MachineBasicBlock &MBB,
              "shouldn't need to do this for x86_64 targets!");
       // A ret can only handle immediates as big as 2**16-1.  If we need to pop
       // off bytes before the return address, we must do it manually.
-      BuildMI(MBB, MBBI, DL, TII->get(X86::POP32r)).addReg(X86::ECX, RegState::Define);
+      BuildMI(MBB, MBBI, DL, TII->get(X86::POP32r))
+          .addReg(X86::ECX, RegState::Define);
       X86FL->emitSPUpdate(MBB, MBBI, DL, StackAdj, /*InEpilogue=*/true);
       BuildMI(MBB, MBBI, DL, TII->get(X86::PUSH32r)).addReg(X86::ECX);
       MIB = BuildMI(MBB, MBBI, DL, TII->get(X86::RET32));
@@ -811,14 +821,30 @@ bool X86ExpandPseudo::expandMI(MachineBasicBlock &MBB,
       MI.removeOperand(i);
     unsigned Opc;
     switch (Opcode) {
-    case X86::PTCMMIMFP16PSV:  Opc = X86::TCMMIMFP16PS; break;
-    case X86::PTCMMRLFP16PSV:  Opc = X86::TCMMRLFP16PS; break;
-    case X86::PTDPBSSDV:   Opc = X86::TDPBSSD; break;
-    case X86::PTDPBSUDV:   Opc = X86::TDPBSUD; break;
-    case X86::PTDPBUSDV:   Opc = X86::TDPBUSD; break;
-    case X86::PTDPBUUDV:   Opc = X86::TDPBUUD; break;
-    case X86::PTDPBF16PSV: Opc = X86::TDPBF16PS; break;
-    case X86::PTDPFP16PSV: Opc = X86::TDPFP16PS; break;
+    case X86::PTCMMIMFP16PSV:
+      Opc = X86::TCMMIMFP16PS;
+      break;
+    case X86::PTCMMRLFP16PSV:
+      Opc = X86::TCMMRLFP16PS;
+      break;
+    case X86::PTDPBSSDV:
+      Opc = X86::TDPBSSD;
+      break;
+    case X86::PTDPBSUDV:
+      Opc = X86::TDPBSUD;
+      break;
+    case X86::PTDPBUSDV:
+      Opc = X86::TDPBUSD;
+      break;
+    case X86::PTDPBUUDV:
+      Opc = X86::TDPBUUD;
+      break;
+    case X86::PTDPBF16PSV:
+      Opc = X86::TDPBF16PS;
+      break;
+    case X86::PTDPFP16PSV:
+      Opc = X86::TDPFP16PS;
+      break;
     case X86::PTTDPBF16PSV:
       Opc = X86::TTDPBF16PS;
       break;

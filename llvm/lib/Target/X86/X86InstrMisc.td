@@ -1768,3 +1768,9 @@ def MOVRS64rm_EVEX : I<0x8B, MRMSrcMem, (outs GR64:$dst), (ins i64mem:$src),
                    [(set GR64:$dst, (int_x86_movrsdi addr:$src))]>, EVEX, NoCD8, T_MAP4, REX_W;
 }
 }
+
+def M5_MARKER : I<0, Pseudo, (outs), (ins GR32:$id),
+                  "m5marker\t$id", []> {
+  let hasNoSchedulingInfo = 1;
+  let hasSideEffects = 1;
+}
