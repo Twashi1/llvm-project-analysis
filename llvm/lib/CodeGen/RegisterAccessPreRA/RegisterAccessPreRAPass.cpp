@@ -715,7 +715,8 @@ void ExtPathCollector::outputCriticalPath() {
          "name,exit_block_name,exit_block_id,branch_prob,start_path_index,end_"
          "path_index,is_start_entry\n";
 
-  OutPathRoots << "module_name,path_index,block_id\n";
+  OutPathRoots
+      << "module_name,path_index,block_id,local_block_id,function_name\n";
 
   OutDAGFile << "module_name,start_comp,end_comp\n";
   OutTopoComp << "module_name,comp_id,comp_priority\n";
@@ -1088,6 +1089,12 @@ void ExtPathCollector::outputCriticalPath() {
     OutBlockAdditional << ModuleName << "," << BlockID << "," << CompID << ","
                        << BlockStat.Cycles * BlockStat.Freq << "\n";
 
+    if (MapIsEntryBlock[BlockID]) {
+      OutPathRoots << ModuleName << "," << CompID << "," << BlockID << ","
+                   << BlockStat.LocalBlockNumber << ","
+                   << BlockStat.FunctionName << "\n";
+    }
+
     // TODO: fix all this trash
     ExtBBStats OutputStatsBB;
     OutputStatsBB.Cycles = BlockStat.Cycles * BlockStat.Freq;
@@ -1199,9 +1206,9 @@ unsigned ExtPathCollector::registerBasicBlock(const std::string &FunctionName,
 
   if (!BlockIDs.count(BlockUniqueIdentifier)) {
     BlockIDs[BlockUniqueIdentifier] = BlockIDCount++;
-    // TODO: push_back can probably auto-call initializer
     ExtBBStats Stats;
     Stats.FunctionName = FunctionName;
+    Stats.LocalBlockNumber = LocalBlockID;
     BlockStats.push_back(Stats);
     GlobalAdjacencyList.push_back(std::vector<unsigned>({}));
   }

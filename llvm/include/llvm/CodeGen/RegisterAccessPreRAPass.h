@@ -43,6 +43,8 @@ struct ExtBBStats {
   std::string Name;
   std::string FunctionName;
   std::string ModuleName;
+
+  int LocalBlockNumber;
 };
 
 struct ExtBlockEdgeData {
