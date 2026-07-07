@@ -28,6 +28,10 @@
 #include <unordered_set>
 // TODO: use numeric limits instead
 #include <cfloat>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <regex>
 
 #define DEBUG_TYPE "reg-access-prera"
 
@@ -1263,6 +1267,726 @@ ExtBBStats &ExtPathCollector::getBBStats(const std::string &FunctionName,
   return BlockStats[BlockID];
 }
 
+char const *unitNameToString(ExtMcPATUnitName const Name) {
+  switch (Name) {
+  case ExtMcPATUnitName::PROCESSOR:
+    return "Processor";
+  case ExtMcPATUnitName::CORE:
+    return "Core";
+  case ExtMcPATUnitName::INSTRUCTION_FETCH_UNIT:
+    return "Instruction Fetch Unit";
+  case ExtMcPATUnitName::INSTRUCTION_CACHE:
+    return "Instruction Cache";
+  case ExtMcPATUnitName::BRANCH_TARGET_BUFFER:
+    return "Branch Target Buffer";
+  case ExtMcPATUnitName::BRANCH_PREDICTOR:
+    return "Branch Predictor";
+  case ExtMcPATUnitName::INSTRUCTION_BUFFER:
+    return "Instruction Buffer";
+  case ExtMcPATUnitName::INSTRUCTION_DECODER:
+    return "Instruction Decoder";
+  case ExtMcPATUnitName::RENAMING_UNIT:
+    return "Renaming Unit";
+  case ExtMcPATUnitName::INT_FRONT_END_RAT:
+    return "Int Front End RAT";
+  case ExtMcPATUnitName::FP_FRONT_END_RAT:
+    return "FP Front End RAT";
+  case ExtMcPATUnitName::FREE_LIST:
+    return "Free List";
+  case ExtMcPATUnitName::INT_RETIRE_RAT:
+    return "Int Retire RAT";
+  case ExtMcPATUnitName::FP_RETIRE_RAT:
+    return "FP Retire RAT";
+  case ExtMcPATUnitName::FP_FREE_LIST:
+    return "FP Free List";
+  case ExtMcPATUnitName::LOAD_STORE_UNIT:
+    return "Load Store Unit";
+  case ExtMcPATUnitName::DATA_CACHE:
+    return "Data Cache";
+  case ExtMcPATUnitName::LOADQ:
+    return "LoadQ";
+  case ExtMcPATUnitName::STOREQ:
+    return "StoreQ";
+  case ExtMcPATUnitName::MEMORY_MANAGEMENT_UNIT:
+    return "Memory Management Unit";
+  case ExtMcPATUnitName::ITLB:
+    return "Itlb";
+  case ExtMcPATUnitName::DTLB:
+    return "Dtlb";
+  case ExtMcPATUnitName::EXECUTION_UNIT:
+    return "Execution Unit";
+  case ExtMcPATUnitName::REGISTER_FILES:
+    return "Register Files";
+  case ExtMcPATUnitName::INTEGER_RF:
+    return "Integer RF";
+  case ExtMcPATUnitName::FLOATING_POINT_RF:
+    return "Floating Point RF";
+  case ExtMcPATUnitName::INSTRUCTION_SCHEDULER:
+    return "Instruction Scheduler";
+  case ExtMcPATUnitName::INSTRUCTION_WINDOW:
+    return "Instruction Window";
+  case ExtMcPATUnitName::FP_INSTRUCTION_WINDOW:
+    return "FP Instruction Window";
+  case ExtMcPATUnitName::ROB:
+    return "ROB";
+  case ExtMcPATUnitName::INTEGER_ALU:
+    return "Integer ALU";
+  case ExtMcPATUnitName::FLOATING_POINT_UNIT:
+    return "Floating Point Unit";
+  case ExtMcPATUnitName::RESULTS_BROADCAST_BUS:
+    return "Results Broadcast Bus";
+  case ExtMcPATUnitName::UNDIFFERENTIATED_CORE:
+    return "Undifferentiated Core";
+  default:
+    return "Unknown";
+  };
+}
+
+static std::optional<ExtMcPATUnit> getUnitStats(std::string const &Name,
+                                                std::string const &Text) {
+  // Assumes Name is sanitised/doesn't contain special characters
+  // C++ default regex implementation is very slow, but we can't use CTREs
+  // Regex pattern is something along the lines of
+  // (whitespace) unit name (possible extra text): some value to capture (units)
+  std::regex Pattern("\\s*" + Name + ".*\\n((?:.+\\s*=\\s*.+\\n)+)",
+                     std::regex_constants::ECMAScript |
+                         std::regex_constants::multiline);
+  std::smatch Match;
+
+  if (!std::regex_search(Text, Match, Pattern)) {
+    return std::nullopt;
+  }
+
+  std::string Block = Match[1].str();
+
+  ExtMcPATUnit Unit;
+
+  std::vector<std::string> const Keys = {"Area", "Peak Dynamic",
+                                         "Subthreshold Leakage", "Gate Leakage",
+                                         "Runtime Dynamic"};
+
+  auto MatchKey = [&](std::string const Key) -> std::optional<float> {
+    std::regex FieldPattern("\\s+" + Key + "\\s*=\\s*(\\S+)\\s.+\\n");
+    std::smatch FieldMatch;
+    if (std::regex_search(Block, FieldMatch, FieldPattern)) {
+      return std::make_optional(std::stof(FieldMatch[1].str()));
+    }
+
+    return std::nullopt;
+  };
+
+  if (auto V = MatchKey("Area"))
+    Unit.AreaMetresSquared = (*V) * 1.0e-6;
+
+  if (auto V = MatchKey("Peak Dynamic"))
+    Unit.PeakDynamic = (*V);
+
+  if (auto V = MatchKey("Subthreshold Leakage"))
+    Unit.SubthresholdLeakage = (*V);
+
+  if (auto V = MatchKey("Gate Leakage"))
+    Unit.GateLeakage = (*V);
+
+  if (auto V = MatchKey("Runtime Dynamic"))
+    Unit.RuntimeDynamic = (*V);
+
+  return Unit;
+};
+
+ExtMcPATOutput readMcPATOutput(char const *FileName) {
+  std::ifstream File(FileName);
+
+  ExtMcPATOutput Output = {0};
+  // We don't set node size, clock rate, or vdd here; while they are findable in
+  // the McPAT output file, its too annoying to parse
+
+  if (!File) {
+    LLVM_DEBUG(errs() << "Failed to open file " << FileName << "\n");
+    return Output;
+  }
+
+  // most vexing parse
+  std::string Text = std::string(std::istreambuf_iterator<char>(File),
+                                 std::istreambuf_iterator<char>());
+
+  auto GetStatsOrPanic = [&](ExtMcPATUnitName Key) {
+    std::string Name = unitNameToString(Key);
+
+    if (auto V = getUnitStats(Name, Text)) {
+      Output.UnitMap.insert({Key, *V});
+    } else {
+      LLVM_DEBUG(errs() << "Failed to grab unit stats for unit name: " << Name
+                        << " for file name: " << FileName << "\n");
+    }
+  };
+
+  // TODO: add bounds to the enum itself so we're less likely to break this
+  for (std::underlying_type_t<ExtMcPATUnitName> i = 0;
+       i < static_cast<std::underlying_type_t<ExtMcPATUnitName>>(
+               ExtMcPATUnitName::UNDIFFERENTIATED_CORE);
+       i++) {
+    GetStatsOrPanic(static_cast<ExtMcPATUnitName>(i));
+  }
+
+  return Output;
+}
+
+float getPowerMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name) {
+  if (Output.UnitMap.find(Name) != Output.UnitMap.end()) {
+    ExtMcPATUnit const &Unit = Output.UnitMap.at(Name);
+
+    return Unit.RuntimeDynamic + Unit.SubthresholdLeakage + Unit.GateLeakage;
+  }
+
+  return 0.0f;
+}
+
+std::string programNameToMcPATFile(std::string ProgramName,
+                                   ExtMcPatInput const &Input) {
+  // We don't encode temperature here because we don't vary it
+  // (including temperature would make it very rare that we have values
+  // available already)
+  // TODO: directory path needs to be here too
+  return ProgramName + "__n" + std::to_string(Input.NodeSize) + "_v" +
+         std::to_string(static_cast<int>(Input.Voltage * 1000.0f)) + "_f" +
+         std::to_string(static_cast<int>(Input.ClockRateHz * 1.0e-6)) + "_id" +
+         std::to_string(Input.BlockID);
+}
+
+static ExtMcPATOutput populateExtraMcPATOutputFields(ExtMcPatInput const &Input,
+                                                     ExtMcPATOutput Output) {
+  Output.BlockID = Input.BlockID;
+  Output.Voltage = Input.Voltage;
+  Output.ClockRateHz = Input.ClockRateHz;
+  Output.NodeSize = Input.NodeSize;
+
+  return Output;
+}
+
+ExtMcPatInput blockStatsToMcPAT(int Id, float Voltage, float ClockRateHz,
+                                int NodeSize,
+                                std::vector<ExtBBStats> const &BlockStats) {
+
+  ExtMcPatInput Input;
+  Input.BlockID = Id;
+  Input.NodeSize = NodeSize;
+  Input.Voltage = Voltage;
+  Input.ClockRateHz = ClockRateHz;
+  Input.TempKelvin = 350; // TODO: from a config file as before
+
+  for (ExtBBStats const &Stats : BlockStats) {
+    Input.CycleCount += Stats.Cycles;
+    Input.InstrCount += Stats.InstrCount;
+    Input.IntInstrCount += Stats.IntInstrCount;
+    Input.FloatInstrCount += Stats.FloatInstrCount;
+    Input.BranchInstrCount += Stats.BranchInstrCount;
+    Input.Loads += Stats.Loads;
+    Input.Stores += Stats.Stores;
+    Input.FunctionCalls += Stats.FunctionCalls;
+    Input.ContextSwitches += Stats.ContextSwitches;
+    Input.MulAccess += Stats.MulAccess;
+    Input.FpuAccess += Stats.FPAccess;
+    Input.IAluAccess += Stats.IntALUAccess;
+    Input.IntRegfileReads += Stats.IntRegfileReads;
+    Input.FloatRegfileReads += Stats.FloatRegfileReads;
+    Input.IntRegfileWrites += Stats.IntRegfileWrites;
+    Input.FloatRegfileWrites += Stats.FloatRegfileWrites;
+  }
+
+  // Fill in extra stats with assumptions
+  Input.BusyCycles = Input.CycleCount;
+  Input.IdleCycles = 0;
+  Input.BranchMispredictions = Input.BranchInstrCount / 20;
+  Input.ROBReads = Input.InstrCount;
+  Input.ROBWrites = Input.InstrCount;
+  Input.RenameReads = Input.InstrCount * 2;
+  Input.RenameWrites = Input.InstrCount;
+  Input.FpRenameReads = Input.InstrCount * 2;
+  Input.FpRenameWrites = Input.InstrCount;
+  Input.InstWindowReads = Input.InstrCount;
+  Input.InstWindowWrites = Input.InstrCount;
+  Input.InstWindowWakeupAccesses = Input.InstrCount * 2;
+  Input.FpInstWindowReads = Input.FloatInstrCount;
+  Input.FpInstWindowWrites = Input.FloatInstrCount;
+  Input.FpInstWindowWakeupAccesses = Input.FloatInstrCount * 2;
+  Input.CdbALUAccess = Input.IAluAccess;
+  Input.CdbFpAccess = Input.FpuAccess;
+  Input.CdbMulAccess = Input.MulAccess;
+  Input.BtbWrites = 0;
+  Input.BtbReads = Input.InstrCount;
+
+  return Input;
+}
+
+ExtMcPATOutput runMcPAT(std::string ProgramName, ExtMcPatInput const &Input) {
+  std::string FileName = programNameToMcPATFile(ProgramName, Input);
+  std::string OutFile = "./mcpat_out/" + ProgramName + "/" + FileName + ".xml";
+  std::string InFile =
+      "./mcpat_inputs/" + ProgramName + "/" + FileName + ".txt";
+
+  if (std::filesystem::is_regular_file(OutFile)) {
+    // Just read the file and return
+    return populateExtraMcPATOutputFields(Input,
+                                          readMcPATOutput(OutFile.c_str()));
+  }
+
+  // TODO: ideally command should just be running McPAT binary
+  // TODO: even better; build McPAT as dll or statically link so we can just
+  // call directly
+  std::string Command =
+      "./run_mcpat_specific.sh " + ProgramName + " " + FileName;
+
+  int Ret = std::system(Command.c_str());
+
+  if (Ret != 0) {
+    LLVM_DEBUG(dbgs() << "Running McPAT failed on: " << ProgramName
+                      << ", file: " << FileName);
+  }
+
+  return populateExtraMcPATOutputFields(Input,
+                                        readMcPATOutput(OutFile.c_str()));
+}
+
+void createMcPATInputFile(char const *FileName, ExtMcPatInput const &Input) {
+  std::ofstream File(FileName);
+
+  if (!File) {
+    LLVM_DEBUG(errs() << "Failed to open file " << FileName << "\n");
+    return;
+  }
+
+  File << "<?xml version='1.0' encoding='utf-8'?>\n";
+
+  auto WriteParam = [&File](char const *Name, std::string const &Value) {
+    File << "<param name='" << Name << "' value='" << Value << "' />";
+  };
+
+  auto WriteStat = [&File](char const *Name, std::string const &Value) {
+    File << "<stat name='" << Name << "' value='" << Value << "' />";
+  };
+
+  auto WriteComponentStart = [&File](char const *Id, char const *Name) {
+    File << "<component id='" << Id << "' name='" << Name << "'>";
+  };
+
+  auto WriteComponentEnd = [&File](void) { File << "</component>"; };
+
+  WriteComponentStart("root", "root");
+
+  { // Start root
+    WriteComponentStart("system", "system");
+
+    { // Start system
+      WriteParam("number_of_cores", std::to_string(1));
+      WriteParam("number_of_L1Directories", std::to_string(0));
+      WriteParam("number_of_L2Directories", std::to_string(1));
+      WriteParam("number_of_L2s", std::to_string(1));
+      WriteParam("Private_L2", std::to_string(0));
+      WriteParam("number_of_L3s", std::to_string(0));
+      WriteParam("number_of_NoCs", std::to_string(1));
+      WriteParam("homogeneous_cores", std::to_string(1));
+      WriteParam("homogeneous_L2s", std::to_string(1));
+      WriteParam("homogeneous_L1Directories", std::to_string(1));
+      WriteParam("homogeneous_L2Directories", std::to_string(1));
+      WriteParam("homogeneous_L3s", std::to_string(1));
+      WriteParam("homogeneous_ccs", std::to_string(1));
+      WriteParam("homogeneous_NoCs", std::to_string(1));
+      WriteParam("core_tech_node", std::to_string(Input.NodeSize));
+      WriteParam("target_core_clockrate",
+                 std::to_string(Input.ClockRateHz * 1.0e-6)); // Hz -> MHz
+      WriteParam("temperature", std::to_string(Input.TempKelvin));
+      WriteParam("number_cache_levels", std::to_string(2));
+      WriteParam("interconnect_projection_type", std::to_string(0));
+      WriteParam("device_type", std::to_string(0));
+      WriteParam("longer_channel_device", std::to_string(0));
+      WriteParam("power_gating", std::to_string(0));
+      WriteParam("machine_bits", std::to_string(64));
+      WriteParam("virtual_address_width", std::to_string(64));
+      WriteParam("physical_address_width", std::to_string(52));
+      WriteParam("virtual_memory_page_size", std::to_string(4096));
+
+      WriteStat("total_cycles", std::to_string(Input.CycleCount));
+      WriteStat("idle_cycles", std::to_string(Input.IdleCycles));
+      WriteStat("busy_cycles", std::to_string(Input.BusyCycles));
+
+      WriteComponentStart("system.core0", "core0");
+
+      { // Start system.core0
+        WriteParam("clock_rate",
+                   std::to_string(Input.ClockRateHz * 1.0e-6)); // Hz -> MHz
+
+        WriteParam("opt_local", std::to_string(1));
+        WriteParam("instruction_length", std::to_string(32));
+        WriteParam("opcode_width", std::to_string(7));
+        WriteParam("x86", std::to_string(0));
+        WriteParam("micro_opcode_width", std::to_string(8));
+        WriteParam("machine_type", std::to_string(0));
+        WriteParam("number_hardware_threads", std::to_string(1));
+        WriteParam("fetch_width", std::to_string(4));
+        WriteParam("number_instruction_fetch_ports", std::to_string(1));
+        WriteParam("decode_width", std::to_string(4));
+        WriteParam("issue_width", std::to_string(4));
+        WriteParam("peak_issue_width", std::to_string(6));
+        WriteParam("commit_width", std::to_string(4));
+        WriteParam("fp_issue_width", std::to_string(2));
+        WriteParam("prediction_width", std::to_string(1));
+        WriteParam("pipelines_per_core", "1,1");
+        WriteParam("pipeline_depth", "7,7");
+        WriteParam("ALU_per_core", std::to_string(4));
+        WriteParam("MUL_per_core", std::to_string(0));
+        WriteParam("FPU_per_core", std::to_string(1));
+        WriteParam("instruction_buffer_size", std::to_string(32));
+        WriteParam("decoded_stream_buffer_size", std::to_string(16));
+        WriteParam("instruction_window_scheme", std::to_string(0));
+        WriteParam("instruction_window_size", std::to_string(20));
+        WriteParam("fp_instruction_window_size", std::to_string(15));
+        WriteParam("ROB_size", std::to_string(80));
+        WriteParam("archi_Regs_IRF_size", std::to_string(32));
+        WriteParam("archi_Regs_FRF_size", std::to_string(32));
+        WriteParam("phy_Regs_IRF_size", std::to_string(80));
+        WriteParam("phy_Regs_FRF_size", std::to_string(72));
+        WriteParam("rename_scheme", std::to_string(1));
+        WriteParam("register_windows_size", std::to_string(0));
+        WriteParam("LSU_order", "inorder");
+        WriteParam("store_buffer_size", std::to_string(32));
+        WriteParam("load_buffer_size", std::to_string(32));
+        WriteParam("memory_ports", std::to_string(2));
+        WriteParam("RAS_size", std::to_string(32));
+
+        WriteStat("total_instructions", std::to_string(Input.InstrCount));
+        WriteStat("int_instructions", std::to_string(Input.IntInstrCount));
+        WriteStat("fp_instructions", std::to_string(Input.FloatInstrCount));
+        WriteStat("branch_instructions",
+                  std::to_string(Input.BranchInstrCount));
+        WriteStat("branch_mispredictions",
+                  std::to_string(Input.BranchMispredictions));
+        WriteStat("load_instructions", std::to_string(Input.Loads));
+        WriteStat("store_instructions", std::to_string(Input.Stores));
+        WriteStat("committed_instructions", std::to_string(Input.InstrCount));
+        WriteStat("committed_int_instructions",
+                  std::to_string(Input.IntInstrCount));
+        WriteStat("committed_fp_instructions",
+                  std::to_string(Input.FloatInstrCount));
+        WriteStat("pipeline_duty_cycle", std::to_string(1));
+
+        WriteStat("total_cycles", std::to_string(Input.CycleCount));
+        WriteStat("idle_cycles", std::to_string(Input.IdleCycles));
+        WriteStat("busy_cycles", std::to_string(Input.BusyCycles));
+
+        WriteStat("ROB_reads", std::to_string(Input.ROBReads));
+        WriteStat("ROB_writes", std::to_string(Input.ROBWrites));
+
+        WriteStat("rename_reads", std::to_string(Input.RenameReads));
+        WriteStat("rename_writes", std::to_string(Input.RenameWrites));
+        WriteStat("fp_rename_reads", std::to_string(Input.FpRenameReads));
+        WriteStat("fp_rename_writes", std::to_string(Input.FpRenameWrites));
+
+        WriteStat("inst_window_reads", std::to_string(Input.InstWindowReads));
+        WriteStat("inst_window_writes", std::to_string(Input.InstWindowWrites));
+        WriteStat("inst_window_wakeup_accesses",
+                  std::to_string(Input.InstWindowWakeupAccesses));
+        WriteStat("fp_inst_window_reads",
+                  std::to_string(Input.FpInstWindowReads));
+        WriteStat("fp_inst_window_writes",
+                  std::to_string(Input.FpInstWindowWrites));
+        WriteStat("fp_inst_window_wakeup_accesses",
+                  std::to_string(Input.FpInstWindowWakeupAccesses));
+
+        WriteStat("int_regfile_reads", std::to_string(Input.IntRegfileReads));
+        WriteStat("float_regfile_reads",
+                  std::to_string(Input.FloatRegfileReads));
+        WriteStat("int_regfile_writes", std::to_string(Input.IntRegfileWrites));
+        WriteStat("float_regfile_writes",
+                  std::to_string(Input.FloatRegfileWrites));
+
+        WriteStat("function_calls", std::to_string(Input.FunctionCalls));
+        WriteStat("context_switches", std::to_string(Input.ContextSwitches));
+
+        WriteStat("ialu_accesses", std::to_string(Input.IAluAccess));
+        WriteStat("fpu_accesses", std::to_string(Input.FpuAccess));
+        WriteStat("mul_accesses", std::to_string(Input.MulAccess));
+        WriteStat("cdb_alu_accesses", std::to_string(Input.CdbALUAccess));
+        WriteStat("cdb_mul_accesses", std::to_string(Input.MulAccess));
+        WriteStat("cdb_fpu_accesses", std::to_string(Input.FpuAccess));
+
+        WriteStat("IFU_duty_cycle", std::to_string(0.5));
+        WriteStat("LSU_duty_cycle", std::to_string(0.5));
+        WriteStat("MemManU_I_duty_cycle", std::to_string(0.5));
+        WriteStat("MemManU_D_duty_cycle", std::to_string(0.5));
+        WriteStat("ALU_duty_cycle", std::to_string(1));
+        WriteStat("MUL_duty_cycle", std::to_string(0.3));
+        WriteStat("FPU_duty_cycle", std::to_string(1));
+        WriteStat("ALU_cdb_duty_cycle", std::to_string(1));
+        WriteStat("MUL_cdb_duty_cycle", std::to_string(0.3));
+        WriteStat("FPU_cdb_duty_cycle", std::to_string(1));
+        WriteParam("number_of_BPT", std::to_string(2));
+
+        WriteComponentStart("system.core0.predictor", "PBT");
+
+        {
+          WriteParam("local_predictor_size", "10, 3");
+          WriteParam("local_predictor_entries", std::to_string(1024));
+          WriteParam("global_predictor_entries", std::to_string(4096));
+          WriteParam("global_predictor_bits", std::to_string(2));
+          WriteParam("chooser_predictor_entries", std::to_string(4096));
+          WriteParam("chooser_predictor_bits", std::to_string(2));
+        }
+
+        WriteComponentEnd();
+
+        WriteComponentStart("system.core0.itlb", "itlb");
+
+        {
+          WriteParam("number_entries", std::to_string(128));
+          WriteStat("total_accesses", std::to_string(Input.ItlbAccess));
+          WriteStat("total_misses", std::to_string(4));
+          WriteStat("conflicts", std::to_string(0));
+        }
+
+        WriteComponentEnd();
+
+        WriteComponentStart("system.core0.icache", "icache");
+
+        {
+          WriteParam("icache_config", "65536,16,2,1,1,2,16,0");
+          WriteParam("buffer_sizes", "16,16,16,0");
+
+          WriteStat("read_accesses", std::to_string(Input.ItlbReads));
+          WriteStat("read_misses", std::to_string(0));
+          WriteStat("conflicts", std::to_string(0));
+        }
+
+        WriteComponentEnd();
+
+        WriteComponentStart("system.core0.dtlb", "dtlb");
+
+        {
+          WriteParam("number_entries", std::to_string(128));
+          WriteStat("total_accesses", std::to_string(Input.DtlbAccess));
+          WriteStat("total_misses", std::to_string(0));
+          WriteStat("conflicts", std::to_string(0));
+        }
+
+        WriteComponentEnd();
+
+        WriteComponentStart("system.core0.dcache", "dcache");
+
+        {
+          WriteParam("dcache_config", "65536, 16, 2, 1, 1, 3, 16, 0");
+          WriteParam("buffer_sizes", "16, 16, 16, 16");
+
+          WriteStat("read_accesses", std::to_string(Input.DtlbReads));
+          WriteStat("write_accesses", std::to_string(Input.DtlbWrites));
+          WriteStat("read_misses", std::to_string(0));
+          WriteStat("write_misses", std::to_string(0));
+          WriteStat("conflicts", std::to_string(0));
+        }
+
+        WriteComponentEnd();
+
+        WriteParam("number_of_BTB", std::to_string(2));
+
+        WriteComponentStart("system.core0.BTB", "BTB");
+
+        {
+          WriteParam("BTB_config", "6144, 4, 2, 1, 1, 3");
+
+          WriteStat("read_accesses", std::to_string(Input.BtbReads));
+          WriteStat("write_accesses", std::to_string(Input.BtbWrites));
+        }
+
+        WriteComponentEnd();
+
+        WriteParam("vdd", std::to_string(Input.Voltage));
+
+      } // End system.core0
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.L1Directory0", "L1Directory0");
+
+      {
+        WriteParam("Directory_type", std::to_string(0));
+        WriteParam("Dir_config", "4096, 2, 0, 1, 100, 100, 8");
+        WriteParam("buffer_sizes", "8, 8, 8, 8");
+        WriteParam("clockrate", std::to_string(Input.ClockRateHz * 1.0e-6));
+        WriteParam("ports", "1, 1, 1");
+        WriteParam("device_type", std::to_string(0));
+
+        WriteStat("read_accesses", std::to_string(Input.InstrCount * 2));
+        WriteStat("write_accesses", std::to_string(0));
+        WriteStat("read_misses", std::to_string(0));
+        WriteStat("write_misses", std::to_string(0));
+        WriteStat("conflicts", std::to_string(0));
+      }
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.L2Directory0", "L2Directory0");
+
+      {
+        WriteParam("Directory_type", std::to_string(0));
+
+        WriteParam("Dir_config", "512, 4, 0, 1, 1, 1");
+        WriteParam("buffer_sizes", "16, 16, 16, 16");
+
+        WriteParam("clockrate", std::to_string(Input.ClockRateHz * 1.0e-6));
+        WriteParam("ports", "1, 1, 1");
+
+        WriteParam("device_type", std::to_string(0));
+
+        WriteStat("read_accesses", std::to_string(0));
+        WriteStat("write_accesses", std::to_string(0));
+        WriteStat("read_misses", std::to_string(0));
+        WriteStat("write_misses", std::to_string(0));
+        WriteStat("conflicts", std::to_string(100));
+      }
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.L20", "L20");
+
+      {
+        WriteParam("L2_config", "1835008,16, 8, 16, 32, 32, 12, 1");
+
+        WriteParam("buffer_sizes", "16, 16, 16, 16");
+
+        WriteParam("clockrate", std::to_string(Input.ClockRateHz * 1.0e-6));
+        WriteParam("ports", "1, 1, 1");
+
+        WriteParam("device_type", std::to_string(0));
+        WriteStat("read_accesses", std::to_string(0));
+        WriteStat("write_accesses", std::to_string(0));
+        WriteStat("read_misses", std::to_string(0));
+        WriteStat("write_misses", std::to_string(0));
+        WriteStat("conflicts", std::to_string(0));
+        WriteStat("duty_cycle", std::to_string(1.0));
+      }
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.L30", "L30");
+
+      {
+        WriteParam("L3_config", "16777216,64,16, 16, 16, 100,1");
+
+        WriteParam("clockrate", std::to_string(850));
+        WriteParam("ports", "1, 1, 1");
+
+        WriteParam("device_type", std::to_string(0));
+        WriteParam("buffer_sizes", "16, 16, 16, 16");
+
+        WriteStat("read_accesses", std::to_string(0));
+        WriteStat("write_accesses", std::to_string(0));
+        WriteStat("read_misses", std::to_string(0));
+        WriteStat("write_misses", std::to_string(0));
+        WriteStat("conflicts", std::to_string(0));
+        WriteStat("duty_cycle", std::to_string(1.0));
+      }
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.NoC0", "noc0");
+
+      {
+        WriteParam("clockrate", std::to_string(Input.ClockRateHz * 1.0e-6));
+        WriteParam("type", std::to_string(1));
+
+        WriteParam("horizontal_nodes", std::to_string(1));
+        WriteParam("vertical_nodes", std::to_string(1));
+        WriteParam("has_global_link", std::to_string(1));
+
+        WriteParam("link_throughput", std::to_string(1));
+        WriteParam("link_latency", std::to_string(1));
+
+        WriteParam("input_ports", std::to_string(8));
+        WriteParam("output_ports", std::to_string(7));
+
+        WriteParam("virtual_channel_per_port", std::to_string(2));
+        WriteParam("input_buffer_entries_per_vc", std::to_string(128));
+        WriteParam("flit_bits", std::to_string(40));
+        WriteParam("chip_coverage", std::to_string(1));
+
+        WriteParam("link_routing_over_percentage", std::to_string(1.0));
+
+        WriteStat("total_accesses", std::to_string(Input.InstrCount / 4));
+
+        WriteStat("duty_cycle", std::to_string(1));
+      }
+      WriteComponentEnd();
+
+      WriteComponentStart("system.mc", "mc");
+
+      {
+        WriteParam("type", std::to_string(0));
+        WriteParam("mc_clock", std::to_string(800));
+        WriteParam("peak_transfer_rate", std::to_string(1600));
+        WriteParam("block_size", std::to_string(16));
+        WriteParam("number_mcs", std::to_string(2));
+
+        WriteParam("memory_channels_per_mc", std::to_string(2));
+        WriteParam("number_ranks", std::to_string(2));
+        WriteParam("withPHY", std::to_string(0));
+
+        WriteParam("req_window_size_per_channel", std::to_string(32));
+        WriteParam("IO_buffer_size_per_channel", std::to_string(32));
+        WriteParam("databus_width", std::to_string(32));
+        WriteParam("addressbus_width", std::to_string(32));
+
+        WriteStat("memory_accesses", std::to_string(Input.InstrCount / 10));
+        WriteStat("memory_reads", std::to_string(Input.InstrCount / 20));
+        WriteStat("memory_writes", std::to_string(Input.InstrCount / 20));
+      }
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.niu", "niu");
+
+      {
+        WriteParam("type", std::to_string(0));
+        WriteParam("clockrate", std::to_string(350));
+        WriteParam("number_units", std::to_string(0));
+        WriteStat("duty_cycle", std::to_string(1.0));
+        WriteStat("total_load_perc", std::to_string(0.7));
+      }
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.pcie", "pcie");
+
+      {
+        WriteParam("type", std::to_string(0));
+        WriteParam("withPHY", std::to_string(1));
+        WriteParam("clockrate", std::to_string(350));
+        WriteParam("number_units", std::to_string(0));
+        WriteParam("num_channels", std::to_string(8));
+        WriteStat("duty_cycle", std::to_string(1.0));
+        WriteStat("total_load_perc", std::to_string(0.7));
+      }
+
+      WriteComponentEnd();
+
+      WriteComponentStart("system.flashc", "flashc");
+
+      {
+        WriteParam("number_flashcs", std::to_string(0));
+        WriteParam("type", std::to_string(1));
+        WriteParam("withPHY", std::to_string(1));
+        WriteParam("peak_transfer_rate", std::to_string(200));
+        WriteStat("duty_cycle", std::to_string(1.0));
+        WriteStat("total_load_perc", std::to_string(0.7));
+      }
+
+      WriteComponentEnd();
+
+    } // End system
+
+    WriteComponentEnd();
+  } // End root
+
+  WriteComponentEnd();
+}
+
 bool extIsProbablyFloatingInstruction(const MachineInstr &MI,
                                       const TargetInstrInfo *TII) {
   // this approach sucks, but I cant access x86 directly (build dependency
@@ -1272,8 +1996,8 @@ bool extIsProbablyFloatingInstruction(const MachineInstr &MI,
 
   // note regular flags don't give us much information, so need to use
   // target-specific
-  // TODO: maybe we can check the flag "MayRaiseFPException" (regular flag, not
-  // target-specific)
+  // TODO: maybe we can check the flag "MayRaiseFPException" (regular flag,
+  // not target-specific)
   static const char *FPPrefixes[] = {
       "FADD",   "FSUB",    "FMUL",   "FDIV",    "FSQRT",  "FREM",    "FCHS",
       "FABS",   "ADDSS",   "SUBSS",  "MULSS",   "DIVSS",  "SQRTSS",  "MINSS",
@@ -1468,7 +2192,8 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
   for (auto &MBB : MF) {
     LLVM_DEBUG(dbgs() << "Collecting info for MBB: " << MBB.getName() << "\n");
 
-    // this is the entry block, record entry block ID for this machine function
+    // this is the entry block, record entry block ID for this machine
+    // function
     if (BlockID == 0) {
       ExtFunctionMetadata FunctionMetadata = PC.getFunctionMetadata(MFName);
       FunctionMetadata.EntryBasicBlock = PC.registerBasicBlock(MFName, BlockID);
@@ -1524,6 +2249,10 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
       const MCInstrDesc &Desc = MI.getDesc();
       StringRef Op = TII->getName(MI.getOpcode());
 
+      // TODO: change to classify int/float instructions based on registers?
+      // or use a combination of the approaches currently extIsProbablyFPU
+      // classifies off different set of prefixes/instruction opcodes compared
+      // to extIsPorbablyFloatingInstruction
       if (extIsProbablyIALU(Op)) {
         BlockStat.IntALUAccess += 1.0;
       }
@@ -1586,7 +2315,8 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
           const MCInstrDesc &Desc = MI.getDesc();
           StringRef Name = TII->getName(MI.getOpcode());
 
-          // LLVM_DEBUG(dbgs() << "Detected load in MI: " << Name << " for BB "
+          // LLVM_DEBUG(dbgs() << "Detected load in MI: " << Name << " for BB
+          // "
           // << BlockStat.Name << "\n");
         }
 
@@ -1594,7 +2324,8 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
           const MCInstrDesc &Desc = MI.getDesc();
           StringRef Name = TII->getName(MI.getOpcode());
 
-          // LLVM_DEBUG(dbgs() << "Detected store in MI: " << Name << " for BB "
+          // LLVM_DEBUG(dbgs() << "Detected store in MI: " << Name << " for BB
+          // "
           // << BlockStat.Name << "\n");
         }
       }
@@ -1661,8 +2392,8 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
     BlockStat.Freq = std::max(BlockStat.Freq, 1.0);
     BlockStat.GlobalFreq = std::max(BlockStat.GlobalFreq, 1.0);
 
-    // TODO: don't need this code anymore, we put in the profile count into the
-    // code itself
+    // TODO: don't need this code anymore, we put in the profile count into
+    // the code itself
     bool FoundProfileData = false;
 
     for (int i = 0; i < profData.size(); i++) {
