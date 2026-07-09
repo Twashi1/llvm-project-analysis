@@ -28,6 +28,7 @@
 #include <unordered_set>
 // TODO: use numeric limits instead
 #include <cfloat>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -42,7 +43,706 @@ char RegisterAccessPreRAPass::ID = 0;
 unsigned RegisterAccessPreRAPass::Processed = 0;
 unsigned RegisterAccessPreRAPass::Total = 0;
 ExtPathCollector RegisterAccessPreRAPass::PC = {};
-std::mutex RegisterAccessPreRAPass::MapLock;
+
+std::vector<ExtVFPair> teiGetSFVVCandidates(float TempKelvin,
+                                            ExtConfigData const &Config) {
+  // Target frequency is baseline
+  float MinimumVoltage = teiVoltageToDiscreteLevel(
+      teiGetVoltage(TempKelvin, Config.BaselineFrequencyGHz * 1.0e9f), Config);
+
+  ExtVFPair Pair;
+  Pair.Voltage = MinimumVoltage;
+  Pair.FrequencyHz = Config.BaselineFrequencyGHz * 1.0e9f;
+
+  // TODO: we can add the other criteria, like if temperature is too low we try
+  // to adjust voltage up
+
+  return std::vector<ExtVFPair>({Pair});
+}
+
+std::vector<ExtVFPair> teiGetVFVVCandidates(float TempKelvin,
+                                            ExtConfigData const &Config) {
+  std::vector<ExtVFPair> UnfilteredResults;
+
+  for (uint32_t i = 0; i < Config.FrequenciesGHz.size(); i++) {
+    float FrequencyHz = Config.FrequenciesGHz[i] * 1.0e9f;
+    float Voltage = teiVoltageToDiscreteLevel(
+        teiGetVoltage(TempKelvin, FrequencyHz), Config);
+
+    ExtVFPair Pair;
+    Pair.FrequencyHz = FrequencyHz;
+    Pair.Voltage = Voltage;
+
+    UnfilteredResults.push_back(Pair);
+  }
+
+  // Look through for TEI sweet spots briefly to eliminate
+  // Frequencies being sorted already makes this simpler
+  float PreviousVoltage = FLT_MAX;
+  std::vector<ExtVFPair> Results;
+
+  for (uint32_t i = UnfilteredResults.size() - 1; i >= 0; i--) {
+    ExtVFPair Candidate = UnfilteredResults[i];
+
+    // Candidate is of lower frequency (we iterate frequencies in descending
+    // order) Candidate has higher or equal voltage, for lower frequency Hence
+    // Candidate is at least worse than the previous pair; i.e. previous pair
+    // was a TEI sweet spot Skip candidate
+    if (Candidate.Voltage >= PreviousVoltage) {
+      continue;
+    }
+
+    PreviousVoltage = Candidate.Voltage;
+    Results.push_back(Candidate);
+  }
+
+  // Not necessary, but it means our frequencies are in ascending order again
+  std::reverse(Results.begin(), Results.end());
+
+  return Results;
+}
+
+float teiVoltageToDiscreteLevel(float Voltage, ExtConfigData const &Config) {
+  Voltage += Config.VoltageAllowedError;
+
+  for (uint32_t i = 0; i < Config.Voltages.size(); i++) {
+    float DiscreteVoltage = Config.Voltages[i];
+
+    if (Voltage < DiscreteVoltage)
+      continue;
+
+    return DiscreteVoltage;
+  }
+
+  LLVM_DEBUG(
+      dbgs() << "Warning: couldn't select high enough discrete voltage level "
+                "for given frequency, returning highest possible voltage\n");
+
+  return Config.Voltages.back();
+}
+
+float teiGetVoltage(float TempKelvin, float FrequencyHz) {
+  float TempCelsius = TempKelvin - 273.15f;
+  float FrequencyGHz = FrequencyHz * 1.0e-9f;
+
+  float D0 = -4.27f;
+  float D1 = 0.0042f;
+  float D2 = 0.0052f;
+  float D3 = 10.06f;
+  float D4 = -2.66f;
+
+  float B1 = D1 * TempCelsius + D3;
+  float B2 = D2 * TempCelsius + D4 - FrequencyGHz;
+
+  float MinimumVoltage =
+      (-B1 + std::sqrt(B1 * B1 - 4.0f * D0 * B2)) / (2.0f * D0);
+
+  return MinimumVoltage;
+}
+
+std::vector<std::string> splitString(std::string const &Str,
+                                     std::string const &Delimiters) {
+  std::vector<std::string> Result;
+  std::string Current;
+
+  for (char c : Str) {
+    if (Delimiters.find(c) != std::string::npos) {
+      if (!Current.empty()) {
+        Result.push_back(std::move(Current));
+        Current.clear();
+      }
+    } else {
+      Current += c;
+    }
+  }
+
+  if (!Current.empty()) {
+    Result.push_back(std::move(Current));
+  }
+
+  return Result;
+}
+
+bool stringStartsWith(std::string const &Str, std::string const &Prefix) {
+  return Str.size() >= Prefix.size() &&
+         Str.compare(0, Prefix.size(), Prefix) == 0;
+}
+
+static float getAreaHotSpotFlp(ExtHotSpotFloorplan Flp,
+                               ExtHotSpotUnitName Name) {
+  return Flp
+      .Units[static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(Name)]
+      .Area;
+}
+
+static float &getPowerHotSpot(ExtHotSpotPowerInput &Power,
+                              ExtHotSpotUnitName Name) {
+  return Power
+      .UnitPower[static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(Name)];
+}
+
+char const *hotSpotUnitNameToString(ExtHotSpotUnitName Name) {
+  switch (Name) {
+  case ExtHotSpotUnitName::L2_LEFT:
+    return "L2_left";
+  case ExtHotSpotUnitName::L2:
+    return "L2";
+  case ExtHotSpotUnitName::L2_RIGHT:
+    return "L2_right";
+  case ExtHotSpotUnitName::ICACHE:
+    return "Icache";
+  case ExtHotSpotUnitName::DCACHE:
+    return "Dcache";
+  case ExtHotSpotUnitName::BPRED_0:
+    return "Bpred_0";
+  case ExtHotSpotUnitName::BPRED_1:
+    return "Bpred_1";
+  case ExtHotSpotUnitName::BPRED_2:
+    return "Bpred_2";
+  case ExtHotSpotUnitName::DTB_0:
+    return "DTB_0";
+  case ExtHotSpotUnitName::DTB_1:
+    return "DTB_1";
+  case ExtHotSpotUnitName::DTB_2:
+    return "DTB_2";
+  case ExtHotSpotUnitName::FPADD_0:
+    return "FPAdd_0";
+  case ExtHotSpotUnitName::FPADD_1:
+    return "FPAdd_1";
+  case ExtHotSpotUnitName::FPMUL_0:
+    return "FPMul_0";
+  case ExtHotSpotUnitName::FPMUL_1:
+    return "FPMul_1";
+  case ExtHotSpotUnitName::FPREG_0:
+    return "FPReg_0";
+  case ExtHotSpotUnitName::FPREG_1:
+    return "FPReg_1";
+  case ExtHotSpotUnitName::FPREG_2:
+    return "FPReg_2";
+  case ExtHotSpotUnitName::FPREG_3:
+    return "FPReg_3";
+  case ExtHotSpotUnitName::FPMAP_0:
+    return "FPMap_0";
+  case ExtHotSpotUnitName::FPMAP_1:
+    return "FPMap_1";
+  case ExtHotSpotUnitName::INTMAP:
+    return "IntMap";
+  case ExtHotSpotUnitName::INTQ:
+    return "IntQ";
+  case ExtHotSpotUnitName::INTREG_0:
+    return "IntReg_0";
+  case ExtHotSpotUnitName::INTREG_1:
+    return "IntReg_1";
+  case ExtHotSpotUnitName::INTEXEC:
+    return "IntExec";
+  case ExtHotSpotUnitName::FPQ:
+    return "FPQ";
+  case ExtHotSpotUnitName::LDSTQ:
+    return "LdStQ";
+  case ExtHotSpotUnitName::ITB_0:
+    return "ITB_0";
+  case ExtHotSpotUnitName::ITB_1:
+    return "ITB_1";
+  default:
+    return "Unknown";
+  };
+}
+
+ExtHotSpotUnitName hotSpotStringToUnitName(std::string Name) {
+  using T = std::underlying_type_t<ExtHotSpotUnitName>;
+
+  for (T i = static_cast<T>(ExtHotSpotUnitName::__FIRST);
+       i < static_cast<T>(ExtHotSpotUnitName::__LAST); i++) {
+    if (Name == hotSpotUnitNameToString(static_cast<ExtHotSpotUnitName>(i))) {
+      return static_cast<ExtHotSpotUnitName>(i);
+    }
+  }
+
+  LLVM_DEBUG(errs() << "Failed to find unit name for unit " << Name << "\n");
+
+  return ExtHotSpotUnitName::__LAST;
+}
+
+ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
+  std::ifstream File(FileName);
+
+  ExtHotSpotTempTrace Trace;
+
+  if (!File) {
+    LLVM_DEBUG(errs() << "Failed to open file: " << FileName << "\n");
+    return Trace;
+  }
+
+  std::string Line;
+  int LineNumber = 0;
+  std::vector<ExtHotSpotUnitName> UnitOrder;
+  while (std::getline(File, Line)) {
+    std::vector<std::string> Parts = splitString(Line, "\n\t ");
+
+    if (Parts.size() != 30) {
+      LLVM_DEBUG(errs() << "Potentially malformed line in output temperature "
+                           "trace at line number: "
+                        << LineNumber + 1 << "\n");
+      continue;
+    }
+
+    if (LineNumber++ == 0) {
+      // TODO: reserve space or use index
+      for (std::string Part : Parts) {
+        ExtHotSpotUnitName UnitName = hotSpotStringToUnitName(Part);
+
+        UnitOrder.push_back(UnitName);
+      }
+
+      continue;
+    }
+
+    for (uint32_t i = 0; i < Parts.size(); i++) {
+      ExtHotSpotUnitName UnitName = UnitOrder[i];
+      float Temp = std::stof(Parts[i]);
+
+      Trace.Temps.at(static_cast<uint32_t>(UnitName)).push_back(Temp);
+    }
+  }
+
+  return Trace;
+}
+
+void writeHotSpotTempInit(float InitialTemperature, char const *FileName) {
+  std::ofstream File(FileName);
+
+  std::stringstream TempStream;
+  TempStream << std::fixed << std::setprecision(3) << InitialTemperature;
+  std::string TempString = TempStream.str();
+
+  for (uint32_t i = 0; i < static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
+       i++) {
+    ExtHotSpotUnitName UnitEnum = static_cast<ExtHotSpotUnitName>(i);
+
+    std::string Line = std::string(hotSpotUnitNameToString(UnitEnum)) + '\t' +
+                       TempString + '\n';
+    File << Line;
+    File << "hsp_" << Line;
+    File << "hsink_" << Line;
+    File << "iface_" << Line;
+  }
+
+  for (uint32_t i = 0; i < 12; i++) {
+    File << "inode_" << i << "\t" << TempString << "\n";
+  }
+}
+
+ExtHotSpotTempTrace
+aggregateTracesAverage(std::vector<ExtHotSpotTempTrace> const &Traces) {
+  if (Traces.size() == 0) {
+    LLVM_DEBUG(errs() << "Cannot aggregate 0 traces\n");
+  }
+
+  uint32_t NumUnits = Traces[0].Temps.size();
+
+  ExtHotSpotTempTrace Output;
+  Output.Temps = std::vector<std::vector<float>>(NumUnits);
+
+  std::vector<float> TotalTempPerUnit = std::vector<float>(NumUnits);
+
+  for (uint32_t UnitIndex = 0; UnitIndex < Output.Temps.size(); UnitIndex++) {
+    float TotalTemp = 0.0f;
+
+    for (uint32_t i = 0; i < Traces.size(); i++) {
+      std::vector<float> const &PerSampleTemps = Traces[i].Temps[UnitIndex];
+      float AverageReading = 0.0f;
+
+      for (float Reading : PerSampleTemps) {
+        AverageReading += Reading;
+      }
+
+      AverageReading /= static_cast<float>(PerSampleTemps.size());
+
+      TotalTemp += AverageReading;
+    }
+
+    Output.Temps.at(UnitIndex) =
+        std::vector<float>({TotalTemp / static_cast<float>(Traces.size())});
+  }
+
+  return Output;
+}
+
+void writeHotSpotTempInit(ExtHotSpotTempTrace PreviousTrace,
+                          char const *FileName) {
+  std::ofstream File(FileName);
+
+  File << std::fixed << std::setprecision(3);
+
+  for (uint32_t i = 0; i < static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
+       i++) {
+    ExtHotSpotUnitName UnitEnum = static_cast<ExtHotSpotUnitName>(i);
+
+    std::vector<float> TempReadings = PreviousTrace.Temps[i];
+    float AverageTemp = 0.0f;
+
+    for (float Reading : TempReadings) {
+      AverageTemp += Reading;
+    }
+
+    AverageTemp /= static_cast<float>(TempReadings.size());
+
+    std::stringstream TempStream;
+    TempStream << std::fixed << std::setprecision(3) << AverageTemp;
+
+    std::string Line = std::string(hotSpotUnitNameToString(UnitEnum)) + '\t' +
+                       TempStream.str() + '\n';
+    File << Line;
+    // TODO: we assume all readings are same as unit temperature, but reality is
+    // likely slightly different?
+    // TODO: heatsink offset
+    File << "hsp_" << Line;
+    File << "hsink_" << Line;
+    File << "iface_" << Line;
+  }
+
+  for (uint32_t i = 0; i < 12; i++) {
+    // TODO: use an area-weighted average for Inode temperatures
+    File << "inode_" << i << "\t" << 350.0f << "\n";
+  }
+}
+
+ExtHotSpotTempInit readHotSpotTempInit(char const *FileName) {
+  std::ifstream File(FileName);
+
+  ExtHotSpotTempInit Trace;
+
+  if (!File) {
+    LLVM_DEBUG(errs() << "Failed to open file: " << FileName << "\n");
+    return Trace;
+  }
+
+  std::string Line;
+  while (std::getline(File, Line)) {
+    std::vector<std::string> Parts = splitString(Line, "\n\t ");
+
+    if (Parts.size() != 2) {
+      // Possibly malformed, or just a blank line
+    } else {
+      std::string UnitName = Parts[0];
+      float Temp = std::stof(Parts[1]);
+
+      // UnitName could be prefixed by
+      // nothing -> Unit
+      // hsp_ -> Heatspreader
+      // iface_ -> Interface
+      // hsink_ -> Heatsink
+
+      // And alternatively...
+      // inode_x where x [0, 11]
+      ExtHotSpotUnitName UnitEnum = ExtHotSpotUnitName::__LAST;
+
+      // TODO: use proper std::underlying_type_t
+      if (stringStartsWith(UnitName, "hsp_")) {
+        UnitEnum = hotSpotStringToUnitName(UnitName.substr(strlen("hsp_")));
+        Trace.Units.at(static_cast<uint32_t>(UnitEnum)).Hsp = Temp;
+      } else if (stringStartsWith(UnitName, "iface_")) {
+        UnitEnum = hotSpotStringToUnitName(UnitName.substr(strlen("iface_")));
+        Trace.Units.at(static_cast<uint32_t>(UnitEnum)).Iface = Temp;
+      } else if (stringStartsWith(UnitName, "hsink_")) {
+        UnitEnum = hotSpotStringToUnitName(UnitName.substr(strlen("hsink_")));
+        Trace.Units.at(static_cast<uint32_t>(UnitEnum)).Hsink = Temp;
+      } else if (stringStartsWith(UnitName, "inode_")) {
+        int InodeIndex = std::stoi(UnitName.substr(strlen("inode_")));
+
+        Trace.Inode[InodeIndex] = Temp;
+
+        continue;
+      } else {
+        UnitEnum = hotSpotStringToUnitName(UnitName);
+        Trace.Units.at(static_cast<uint32_t>(UnitEnum)).Unit = Temp;
+      }
+
+      if (UnitEnum == ExtHotSpotUnitName::__LAST) {
+        LLVM_DEBUG(errs() << "Invalid file format for line: " << Line << "\n");
+
+        continue;
+      }
+    }
+  }
+
+  return Trace;
+}
+
+ExtHotSpotFloorplan readHotSpotFloorplan(char const *FileName) {
+  std::ifstream File(FileName);
+
+  ExtHotSpotFloorplan Floorplan;
+
+  if (!File) {
+    LLVM_DEBUG(errs() << "Failed to open file: " << FileName << "\n");
+    return Floorplan;
+  }
+
+  std::string Line;
+  while (std::getline(File, Line)) {
+    std::vector<std::string> Parts = splitString(Line, "\n\t ");
+
+    if (Parts.size() != 5) {
+      // Possibly malformed; should warn (could also just be blank lines)
+    } else {
+      std::string UnitName = Parts[0];
+      float Left = std::stof(Parts[1]);
+      float Bottom = std::stof(Parts[2]);
+      float Width = std::stof(Parts[3]);
+      float Height = std::stof(Parts[4]);
+
+      ExtHotSpotUnitName UnitEnum = hotSpotStringToUnitName(UnitName);
+      ExtHotSpotFlpUnit &Unit = Floorplan.Units.at(
+          static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(UnitEnum));
+      Unit.Left = Left;
+      Unit.Bottom = Bottom;
+      Unit.Width = Width;
+      Unit.Height = Height;
+      Unit.Area = Width * Height;
+    }
+  }
+
+  return Floorplan;
+}
+
+ExtHotSpotPowerInput
+mapMcPATPowerToHotspotPower(ExtMcPATOutput const &McPatPower,
+                            ExtHotSpotFloorplan const &HotSpotFlp,
+                            ExtConfigData const &Config) {
+  ExtHotSpotPowerInput HotSpotPower;
+
+  // Floorplan is already scaled by McPAT area (by a python script, but its just
+  // setup so acceptable?)
+
+  // TODO: L2 cache temperature
+  // TODO: unused residuals
+  float IfuResidual =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INSTRUCTION_FETCH_UNIT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INSTRUCTION_CACHE) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::BRANCH_TARGET_BUFFER) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::BRANCH_PREDICTOR) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INSTRUCTION_DECODER) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INSTRUCTION_BUFFER);
+
+  float RenameResidual =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::RENAMING_UNIT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INT_FRONT_END_RAT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FP_FRONT_END_RAT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INT_RETIRE_RAT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FP_RETIRE_RAT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FP_FREE_LIST) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FREE_LIST);
+
+  float LoadStoreResidual =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::LOAD_STORE_UNIT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::DATA_CACHE) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::LOADQ) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::STOREQ);
+
+  float MemoryManagementResidual =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::MEMORY_MANAGEMENT_UNIT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::ITLB) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::DTLB);
+
+  float ExecutionResidual =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::EXECUTION_UNIT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::REGISTER_FILES) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INSTRUCTION_SCHEDULER) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INTEGER_ALU) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FLOATING_POINT_UNIT) -
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::RESULTS_BROADCAST_BUS);
+
+  float FloatPointMap =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FP_FREE_LIST) +
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FP_RETIRE_RAT) +
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FP_FRONT_END_RAT);
+
+  float IntMap = getPowerMcPAT(McPatPower, ExtMcPATUnitName::FREE_LIST) +
+                 getPowerMcPAT(McPatPower, ExtMcPATUnitName::INT_RETIRE_RAT) +
+                 getPowerMcPAT(McPatPower, ExtMcPATUnitName::INT_FRONT_END_RAT);
+
+  float FpUnit =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FLOATING_POINT_UNIT);
+  float FpRf = getPowerMcPAT(McPatPower, ExtMcPATUnitName::FLOATING_POINT_RF);
+  float Dtb = getPowerMcPAT(McPatPower, ExtMcPATUnitName::DTLB);
+  float Itb = getPowerMcPAT(McPatPower, ExtMcPATUnitName::ITLB);
+  float Bpred = getPowerMcPAT(McPatPower, ExtMcPATUnitName::BRANCH_PREDICTOR);
+  float IntQ = getPowerMcPAT(McPatPower, ExtMcPATUnitName::INSTRUCTION_WINDOW);
+  float IntRf = getPowerMcPAT(McPatPower, ExtMcPATUnitName::INTEGER_RF);
+  float IntAlu = getPowerMcPAT(McPatPower, ExtMcPATUnitName::INTEGER_ALU);
+  float FloatQ =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::FP_INSTRUCTION_WINDOW);
+  float LoadStoreQ = getPowerMcPAT(McPatPower, ExtMcPATUnitName::LOADQ) +
+                     getPowerMcPAT(McPatPower, ExtMcPATUnitName::STOREQ);
+
+  float TotalExecutionArea =
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPADD_0) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPADD_1) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_0) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_1) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_2) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_3) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPMUL_0) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPMUL_1) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPQ) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTQ) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTEXEC) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTREG_0) +
+      getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTREG_1);
+
+  // TODO: need to get L2 stats
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::ICACHE) =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::INSTRUCTION_CACHE);
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::DCACHE) =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::DATA_CACHE);
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::BPRED_0) = Bpred / 3.0;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::BPRED_1) = Bpred / 3.0;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::BPRED_2) = Bpred / 3.0;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::DTB_0) = Dtb / 3.0;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::DTB_1) = Dtb / 3.0;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::DTB_2) = Dtb / 3.0;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPADD_0) =
+      FpUnit / 4.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPADD_0) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPADD_1) =
+      FpUnit / 4.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPADD_1) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPMUL_0) =
+      FpUnit / 4.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPMUL_0) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPMUL_1) =
+      FpUnit / 4.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPMUL_1) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPREG_0) =
+      FpRf / 4.0 + (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_0) /
+                    TotalExecutionArea) *
+                       ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPREG_1) =
+      FpRf / 4.0 + (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_1) /
+                    TotalExecutionArea) *
+                       ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPREG_2) =
+      FpRf / 4.0 + (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_2) /
+                    TotalExecutionArea) *
+                       ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPREG_3) =
+      FpRf / 4.0 + (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPREG_3) /
+                    TotalExecutionArea) *
+                       ExecutionResidual;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPMAP_0) =
+      FloatPointMap / 2.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPMAP_0) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPMAP_1) =
+      FloatPointMap / 2.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPMAP_1) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::INTREG_0) =
+      IntRf / 2.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTREG_0) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::INTREG_1) =
+      IntRf / 2.0 +
+      (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTREG_1) /
+       TotalExecutionArea) *
+          ExecutionResidual;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::INTMAP) = IntMap;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::ITB_0) = Itb / 2.0;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::ITB_1) = Itb / 2.0;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::LDSTQ) = LoadStoreQ;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::FPQ) =
+      FloatQ + (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::FPQ) /
+                TotalExecutionArea) *
+                   ExecutionResidual;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::INTQ) =
+      IntQ + (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTQ) /
+              TotalExecutionArea) *
+                 ExecutionResidual;
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::INTEXEC) =
+      IntAlu + (getAreaHotSpotFlp(HotSpotFlp, ExtHotSpotUnitName::INTEXEC) /
+                TotalExecutionArea) *
+                   ExecutionResidual;
+
+  // execution_units = [
+  //     "FPAdd_0",
+  //     "FPAdd_1",
+  //     "FPReg_0",
+  //     "FPReg_1",
+  //     "FPReg_2",
+  //     "FPReg_3",
+  //     "FPMul_0",
+  //     "FPMul_1",
+  //     "FPQ",
+  //     "IntQ",
+  //     "IntExec",
+  //     "IntReg_0",
+  //     "IntReg_1",
+  // ]
+  //
+  // l2_power = get_static_dynamic_power(unit_stats, ["L2"])
+  //
+  //     "L2_left": l2_power / 3.0,
+  //     "L2": l2_power / 3.0,
+  //     "L2_right": l2_power / 3.0,
+
+  //     "FPAdd_0": fpu_power / 4.0
+  //     + area_fraction("FPAdd_0", execution_total_area) *
+  //     execution_residual, "FPAdd_1": fpu_power / 4.0
+  //     + area_fraction("FPAdd_1", execution_total_area) *
+  //     execution_residual, "FPReg_0": fp_rf_power / 4.0
+  //     + area_fraction("FPReg_0", execution_total_area) *
+  //     execution_residual, "FPReg_1": fp_rf_power / 4.0
+  //     + area_fraction("FPReg_1", execution_total_area) *
+  //     execution_residual, "FPReg_2": fp_rf_power / 4.0
+  //     + area_fraction("FPReg_2", execution_total_area) *
+  //     execution_residual, "FPReg_3": fp_rf_power / 4.0
+  //     + area_fraction("FPReg_3", execution_total_area) *
+  //     execution_residual, "FPMul_0": fpu_power / 4.0
+  //     + area_fraction("FPMul_0", execution_total_area) *
+  //     execution_residual, "FPMul_1": fpu_power / 4.0
+  //     + area_fraction("FPMul_1", execution_total_area) *
+  //     execution_residual, "FPMap_0": fp_map_power / 2.0, "FPMap_1":
+  //     fp_map_power / 2.0, "IntMap": int_map_power, "IntQ": intq_power
+  //     + area_fraction("IntQ", execution_total_area) * execution_residual,
+  //     "IntReg_0": int_rf_power / 2.0
+  //     + area_fraction("IntReg_0", execution_total_area) *
+  //     execution_residual, "IntReg_1": int_rf_power / 2.0
+  //     + area_fraction("IntReg_1", execution_total_area) *
+  //     execution_residual, "IntExec": int_alu_power
+  //     + area_fraction("IntExec", execution_total_area) *
+  //     execution_residual, "FPQ": fpq_power
+  //     + area_fraction("FPQ", execution_total_area) * execution_residual,
+  //     "LdStQ": lsq_power,
+  //     "ITB_0": itb_power / 2.0,
+  //     "ITB_1": itb_power / 2.0,
+  // }
+  //
+  // return hotspot_mapping
+
+  return HotSpotPower;
+}
 
 std::stringstream extOutputBBStats(const ExtBBStats &values,
                                    unsigned UniqueBlockID) {
@@ -1436,6 +2136,16 @@ float getPowerMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name) {
     ExtMcPATUnit const &Unit = Output.UnitMap.at(Name);
 
     return Unit.RuntimeDynamic + Unit.SubthresholdLeakage + Unit.GateLeakage;
+  }
+
+  return 0.0f;
+}
+
+float getAreaMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name) {
+  if (Output.UnitMap.find(Name) != Output.UnitMap.end()) {
+    ExtMcPATUnit const &Unit = Output.UnitMap.at(Name);
+
+    return Unit.AreaMetresSquared;
   }
 
   return 0.0f;

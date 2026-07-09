@@ -47,6 +47,43 @@ struct ExtBBStats {
   int LocalBlockNumber;
 };
 
+enum class ExtHotSpotUnitName : uint32_t {
+  __FIRST = 0,
+  L2_LEFT = __FIRST,
+  L2,
+  L2_RIGHT,
+  ICACHE,
+  DCACHE,
+  BPRED_0,
+  BPRED_1,
+  BPRED_2,
+  DTB_0,
+  DTB_1,
+  DTB_2,
+  FPADD_0,
+  FPADD_1,
+  FPREG_0,
+  FPREG_1,
+  FPREG_2,
+  FPREG_3,
+  FPMUL_0,
+  FPMUL_1,
+  FPMAP_0,
+  FPMAP_1,
+  INTMAP,
+  INTQ,
+  INTREG_0,
+  INTREG_1,
+  INTEXEC,
+  FPQ,
+  LDSTQ,
+  ITB_0,
+  ITB_1,
+  __LAST,
+};
+
+// TODO: add in L2 cache
+// TODO: add in bounds __FIRST and __LAST for iteration
 enum class ExtMcPATUnitName : uint32_t {
   PROCESSOR = 0,
   CORE,
@@ -99,7 +136,21 @@ struct ExtMcPATOutput {
   float Voltage;
   float ClockRateHz;
 
+  // TODO: just use a vector
   std::unordered_map<ExtMcPATUnitName, ExtMcPATUnit> UnitMap;
+};
+
+struct ExtHotSpotFlpUnit {
+  // all units in metres
+  float Left;
+  float Bottom;
+  float Width;
+  float Height;
+  float Area;
+};
+
+struct ExtHotSpotFloorplan {
+  std::vector<ExtHotSpotFlpUnit> Units;
 };
 
 struct ExtMcPatInput {
@@ -153,47 +204,49 @@ struct ExtMcPatInput {
   int BtbWrites;
 };
 
+// TODO: read/write from cfg file
+struct ExtConfigData {
+  bool UseResiduals = false;
+  int HeatsinkOffset = 0;
+  // Assumes both are given in increasing order
+  std::vector<float> FrequenciesGHz = {3.0f, 3.1f, 3.2f, 3.3f,
+                                       3.4f, 3.5f, 3.6f};
+  std::vector<float> Voltages = {0.6f, 0.65f, 0.7f, 0.75f, 0.8f, 0.85f, 0.9f};
+  float BaselineVoltage = 0.8f;
+  float BaselineFrequencyGHz = 3.0f;
+  float VoltageAllowedError = 0.02f;
+};
+
 // TODO: for each component that shows up in the floorplan (and some of the
 // extras), what is their temperature
-struct ExtHotSpotTempTrace {};
+// TODO: instead of a ton of variables, convert to a map of enums to values,
+// easier to write code for
+// All units kelvin
+struct ExtHotSpotTempUnit {
+  float Unit;
+  float Hsp;
+  float Iface;
+  float Hsink;
+};
+
+struct ExtHotSpotTempInit {
+  std::vector<ExtHotSpotTempUnit> Units;
+  std::array<float, 12> Inode; // Temps of Inode
+};
+
+struct ExtHotSpotTempTrace {
+  std::vector<std::vector<float>> Temps;
+};
 
 // TODO: mapping from McPATOutputData to ExtHotSpotPowerInput
 // TODO: writing this to a file, running hotspot, and parsing the output
 // TODO: in the step above, also need to read, modify, and write the config file
 struct ExtHotSpotPowerInput {
+  // Total timespan; will be divied by number of samples
   float Timespan;
   int NumSamples;
 
-  float L2_left;
-  float L2;
-  float L2_right;
-  float Icache;
-  float Dcache;
-  float Bpred_0;
-  float Bpred_1;
-  float Bpred_2;
-  float DTB_0;
-  float DTB_1;
-  float DTB_2;
-  float FPAdd_0;
-  float FPAdd_1;
-  float FPReg_0;
-  float FPReg_1;
-  float FPReg_2;
-  float FPReg_3;
-  float FPMul_0;
-  float FPMul_1;
-  float FPMap_0;
-  float FPMap_1;
-  float IntMap;
-  float IntQ;
-  float IntReg_0;
-  float IntReg_1;
-  float IntExec;
-  float FPQ;
-  float LdStQ;
-  float ITB_0;
-  float ITB_1;
+  std::vector<float> UnitPower;
 };
 
 struct ExtBlockEdgeData {
@@ -215,10 +268,30 @@ struct ExtFinalGraphAnalysisContext {
       SubgraphToBlocks; // Map from subgraph ID to blocks
   std::vector<std::vector<unsigned>>
       GlobalAdjacencyList; // Should be the adjacency list of subgraphs
+  std::vector<std::vector<unsigned>> DisjointSubgraphBlocks;
   // TODO: do we need subgraph roots/internal end blocks? - internal end blocks
   // required for identification of DVS calling points
 };
 
+struct ExtVFPair {
+  float FrequencyHz;
+  float Voltage;
+};
+
+float teiGetVoltage(float TempKelvin, float FrequencyHz);
+float teiVoltageToDiscreteLevel(float Voltage, ExtConfigData const &Config);
+std::vector<ExtVFPair> teiGetSFVVCandidates(float TempKelvin,
+                                            ExtConfigData const &Config);
+std::vector<ExtVFPair> teiGetVFVVCandidates(float TempKelvin,
+                                            ExtConfigData const &Config);
+
+std::vector<std::string> splitString(std::string const &Str,
+                                     std::string const &Delimiters);
+bool stringStartsWith(std::string const &Str, std::string const &Prefix);
+char const *hotSpotUnitNameToString(ExtHotSpotUnitName Name);
+ExtHotSpotUnitName hotSpotStringToUnitName(std::string Name);
+
+// TODO: prefix with McPAT to distinguish against hotspot name conversion
 char const *unitNameToString(ExtMcPATUnitName const Name);
 void createMcPATInputFile(char const *FileName, ExtMcPatInput const &Input);
 ExtMcPATOutput readMcPATOutput(char const *FileName);
@@ -226,10 +299,28 @@ std::string programNameToMcPATFile(std::string ProgramName,
                                    ExtMcPatInput const &Input);
 ExtMcPATOutput runMcPAT(std::string ProgramName, ExtMcPatInput const &Input);
 float getPowerMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name);
+float getAreaMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name);
 // Expects stats have already been multiplied out by Frequency
 ExtMcPatInput blockStatsToMcPAT(int Id, float Voltage, float ClockRateHz,
                                 int NodeSize,
                                 std::vector<ExtBBStats> const &BlockStats);
+ExtHotSpotFloorplan readHotSpotFloorplan(char const *FileName);
+ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName);
+// TODO: take config for heatsink offset?
+void writeHotSpotTempInit(float InitialTemperature, char const *FileName);
+void writeHotSpotTempInit(ExtHotSpotTempTrace PreviousTrace,
+                          char const *FileName);
+ExtHotSpotTempTrace
+aggregateTracesAverage(std::vector<ExtHotSpotTempTrace> const &Traces);
+// TODO: function that aggregates traces and outputs a single one based on
+// something
+ExtHotSpotTempInit readHotSpotTempInit(char const *FileName);
+void writeHotSpotPowerTrace(ExtHotSpotPowerInput Power, char const *FileName);
+
+ExtHotSpotPowerInput
+mapMcPATPowerToHotspotPower(ExtMcPATOutput const &McPatPower,
+                            ExtHotSpotFloorplan const &HotSpotFlp,
+                            ExtConfigData const &Config);
 
 bool extIsProbablyFloatingInstruction(const MachineInstr &MI,
                                       const TargetInstrInfo *TII);
@@ -322,8 +413,6 @@ public:
   static unsigned Processed;
   static unsigned Total;
   static ExtPathCollector PC;
-  // TODO: think this is for old BBCounts, but never used, so can remove?
-  static std::mutex MapLock;
   RegisterAccessPreRAPass() : MachineFunctionPass(ID) {}
 
   void getAnalysisUsage(AnalysisUsage &AU) const override;
@@ -334,6 +423,8 @@ public:
   }
 };
 
+// TODO: we don't register this properly with the pass manager, and so we can't
+// actually properly choose when the pass does/doesn't run
 FunctionPass *createRegisterAccessPreRAPass();
 
 } // namespace llvm
