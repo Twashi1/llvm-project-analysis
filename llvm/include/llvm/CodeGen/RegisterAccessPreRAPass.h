@@ -16,6 +16,12 @@
 
 namespace llvm {
 
+// TODO: if we find the time in future, we use these for easier to understand
+// semantics
+typedef unsigned ExtSubgraphID;
+typedef unsigned ExtComponentID;
+typedef unsigned ExtBlockID;
+
 struct ExtBBStats {
   double Cycles;
   double Freq;
@@ -215,12 +221,16 @@ struct ExtConfigData {
   float BaselineVoltage = 0.8f;
   float BaselineFrequencyGHz = 3.0f;
   float VoltageAllowedError = 0.02f;
+  float InitialTemperatureCelsius = 77.0f;
+  int NodeSize = 14;
+  float MaximumTemperatureKelvin = 355.0f; // 82 degrees limit
 };
 
-// TODO: for each component that shows up in the floorplan (and some of the
-// extras), what is their temperature
-// TODO: instead of a ton of variables, convert to a map of enums to values,
-// easier to write code for
+// Just the properties we need to overwrite
+struct ExtHotSpotConfig {
+  float TimePerSample = 0.0f;
+};
+
 // All units kelvin
 struct ExtHotSpotTempUnit {
   float Unit;
@@ -235,6 +245,7 @@ struct ExtHotSpotTempInit {
 };
 
 struct ExtHotSpotTempTrace {
+  // All units kelvin
   std::vector<std::vector<float>> Temps;
 };
 
@@ -259,24 +270,108 @@ struct ExtBlockEdgeData {
                        // functions
 };
 
-struct ExtFinalGraphAnalysisContext {
-  std::vector<ExtMcPatInput> McPatInputs;
-  std::vector<ExtMcPATOutput> McPatOutputs;
-  std::vector<ExtBBStats> Blocks;
-  std::map<std::pair<unsigned, unsigned>, ExtBlockEdgeData> BlockEdgeData;
-  std::vector<std::vector<unsigned>>
-      SubgraphToBlocks; // Map from subgraph ID to blocks
-  std::vector<std::vector<unsigned>>
-      GlobalAdjacencyList; // Should be the adjacency list of subgraphs
-  std::vector<std::vector<unsigned>> DisjointSubgraphBlocks;
-  // TODO: do we need subgraph roots/internal end blocks? - internal end blocks
-  // required for identification of DVS calling points
+struct ExtOutputStats {
+  float Energy;
+  float Time;
+  float Power;
+  float EnergyDelayProduct;
+  float IPS;
+  float Instructions;
+  float Cycles;
+  float Frequency;
+  float Voltage;
 };
 
 struct ExtVFPair {
   float FrequencyHz;
   float Voltage;
 };
+
+struct ExtFinalAnalysisContext {
+  // We take as input
+  // - the list of topologically sorted subgraphs
+  // - for each candidate VF level
+  //  - we take the stats of each subgraph and create McPATInput
+  //  - we record the output for each VF level
+  //  - we compute optimal EDP
+  //  - we find every child subgraph from a global adjacency list on the
+  //  subgraphs
+  //  - we find the heat data (assumed recorded), take an aggregate
+  //  - we run hotspot, and record output heat data
+  //  - we loop if output heat data too hot (or if temperature violation found)
+  // - we finalise with the start, peak, and final temperature, vf configuration
+  // of each subgraph
+  //  - we output the required information to identify every start block, and
+  //  every internal end block
+  //  - we can then either insert the required vf changes into those blocks, or
+  //  insert additional header/ender blocks, find blocks that post/pre-dominate
+  //  etc.
+
+  // TODO: one thing we can consider doing: instead of summing stats per
+  // component/block, then running through our pipeline
+  // - we instead simulate the CFG within a subgraph (as best as we can), and
+  //    get readings per-block of power, temperature, etc.
+  // - allows us to maybe get a view on the peak temperature any individual
+  //    block reaches, and to see if temperature ever dips below the point where
+  //    the current VF level can be sustained
+
+  // From this; required information
+  // - adjacency list on subgraphs
+  // - (approximately) topologically sorted subgraphs
+  // - mapping from subgraph -> sum of block stats
+  // - mapping from subgraph -> list of blocks
+  // - mapping from subgraph -> list of entry blocks
+  // - mapping from subgraph -> list of internal exit blocks
+  // - mapping from VF level + subgraph id -> McPAT input
+  // - mapping from VF level + subgraph id -> McPAT output
+  // - mapping from VF level + subgraph id -> HotSpot output
+  std::vector<std::vector<ExtSubgraphID>> SubgraphAdjacencyList;
+  std::vector<ExtSubgraphID> TopoSortedSubgraphs;
+  std::vector<ExtBBStats> SubgraphStats; // Summed stats per subgraph
+  std::vector<ExtBBStats> BlockStats;    // Stats per block
+  std::vector<std::vector<ExtBlockID>>
+      SubgraphBlocks; // Blocks in each subgraph
+  std::vector<std::vector<ExtBlockID>> SubgraphEntryBlocks;
+  std::vector<std::vector<ExtBlockID>> SubgraphInternalExitBlocks;
+  std::vector<std::vector<ExtMcPATOutput>>
+      SubgraphMcPATOutput; // Indexable by ExtSubgraphID, gives list of outputs
+                           // for the various tested VF levels
+  std::vector<std::vector<ExtHotSpotTempTrace>>
+      SubgraphHotSpotOutput; // Indexable by ExtSubgraphID, gives list of
+                             // outputs for various tested VF levels
+  std::vector<std::optional<ExtHotSpotTempTrace>>
+      SubgraphHotSpotFinalTemp; // The final temperature of a subgraph given
+                                // whatever VF level was selected
+  std::vector<std::optional<ExtVFPair>> SubgraphBestVFPair;
+  std::vector<std::optional<ExtOutputStats>> SubgraphOutputStats;
+};
+
+struct ExtBlockDVSInformation {
+  ExtOutputStats OutputStats;
+  ExtBBStats BlockStats;
+
+  float Voltage;
+  float Frequency;
+};
+
+void performFullAnalysis(ExtFinalAnalysisContext &Context,
+                         ExtConfigData const &Config, bool ForceBaseline);
+void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
+                                  ExtFinalAnalysisContext const &BaselineRun,
+                                  ExtConfigData const &ConfigData,
+                                  char const *FileName);
+int getVoltageIndex(ExtConfigData const &Config, float Voltage);
+std::string cleanModuleName(char const *ModuleName);
+std::vector<ExtBlockDVSInformation>
+getBlockDVSInformation(ExtFinalAnalysisContext const &Context);
+void writeDVSInformation(std::vector<ExtBlockDVSInformation> const &Information,
+                         ExtConfigData const &Config, char const *FileName);
+ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
+                                    ExtHotSpotTempTrace const &TempTrace,
+                                    ExtBBStats const &Stats);
+// Takes time-weighted averages of Frequency, Voltage, Power, IPS
+ExtOutputStats
+combineOutputStats(std::vector<ExtOutputStats> const &OutputStats);
 
 float teiGetVoltage(float TempKelvin, float FrequencyHz);
 float teiVoltageToDiscreteLevel(float Voltage, ExtConfigData const &Config);
@@ -306,14 +401,26 @@ ExtMcPatInput blockStatsToMcPAT(int Id, float Voltage, float ClockRateHz,
                                 std::vector<ExtBBStats> const &BlockStats);
 ExtHotSpotFloorplan readHotSpotFloorplan(char const *FileName);
 ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName);
+ExtHotSpotTempTrace initDefaultHotSpotTrace(float AssumedTemperatureKelvin);
+ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
+                               ExtMcPATOutput const &Power,
+                               ExtBBStats const &Stats,
+                               ExtHotSpotTempTrace const &InitialTrace,
+                               ExtConfigData const &Config);
 // TODO: take config for heatsink offset?
 void writeHotSpotTempInit(float InitialTemperature, char const *FileName);
 void writeHotSpotTempInit(ExtHotSpotTempTrace PreviousTrace,
                           char const *FileName);
+// TODO: nice if we had ExtHotSpotTempTrace, but then ExtHotSpotTempReading,
+// where a reading is a single trace line, for reference, this would return
+// ExtHotSpotTempReading
 ExtHotSpotTempTrace
 aggregateTracesAverage(std::vector<ExtHotSpotTempTrace> const &Traces);
 // TODO: function that aggregates traces and outputs a single one based on
 // something
+float areaWeightedCoreTemp(ExtHotSpotTempTrace const &TempTrace,
+                           ExtHotSpotFloorplan const &Flp);
+float peakTemp(ExtHotSpotTempTrace const &TempTrace);
 ExtHotSpotTempInit readHotSpotTempInit(char const *FileName);
 void writeHotSpotPowerTrace(ExtHotSpotPowerInput Power, char const *FileName);
 
@@ -321,6 +428,8 @@ ExtHotSpotPowerInput
 mapMcPATPowerToHotspotPower(ExtMcPATOutput const &McPatPower,
                             ExtHotSpotFloorplan const &HotSpotFlp,
                             ExtConfigData const &Config);
+
+void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName);
 
 bool extIsProbablyFloatingInstruction(const MachineInstr &MI,
                                       const TargetInstrInfo *TII);
@@ -333,7 +442,6 @@ bool extIsProbablyFPU(StringRef N);
 bool extIsProbablyMUL(StringRef N);
 bool extIsProbablyCall(StringRef N);
 bool extIsProbablyReturn(StringRef N);
-std::vector<ExtBBStats> extProfileToBBStats(StringRef fileName);
 
 // use functions in conjunction, they produce more headers/values than BB itself
 std::stringstream extOutputBBStats(const ExtBBStats &values);
@@ -373,6 +481,7 @@ struct ExtPathCollector {
   // adjacency list of SCCs
   std::vector<std::vector<int>> DAGAdjacency;
   // TODO: rename in order
+  // TODO: unused?
   // critical path of components
   std::vector<int> CriticalPathComps;
 
@@ -381,6 +490,8 @@ struct ExtPathCollector {
   std::vector<std::vector<unsigned>> DisjointSubgraphBlocks;
   std::vector<std::vector<unsigned>> PotentialStartBlocks;
   std::vector<std::vector<unsigned>> PotentialExitBlocks;
+  std::vector<std::vector<int>>
+      SCCsInSubgraph; // List of components in each subgraph
   std::vector<std::vector<unsigned>> SubgraphInternalEndBlocks;
   std::vector<int> SubgraphRoots;
 
@@ -426,6 +537,8 @@ public:
 // TODO: we don't register this properly with the pass manager, and so we can't
 // actually properly choose when the pass does/doesn't run
 FunctionPass *createRegisterAccessPreRAPass();
+
+ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC);
 
 } // namespace llvm
 

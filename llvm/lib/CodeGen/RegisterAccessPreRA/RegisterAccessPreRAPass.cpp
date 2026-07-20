@@ -5,7 +5,9 @@
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetSchedule.h"
+#include "llvm/DebugInfo/CodeView/RecordSerialization.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/ErrorOr.h"
@@ -33,16 +35,91 @@
 #include <fstream>
 #include <optional>
 #include <regex>
+#include <vector>
 
 #define DEBUG_TYPE "reg-access-prera"
 
 using namespace llvm;
 
 namespace llvm {
+
+static constexpr char const *HOTSPOT_CONFIG_FILE_PATH =
+    "./hotspot_files/example.config";
+static constexpr char const *HOTSPOT_GCC_INIT_PATH = "./hotspot_files/gcc.init";
+static constexpr char const *HOTSPOT_FLOORPLAN_PATH =
+    "./hotspot_files/out_flp.flp";
+static constexpr char const *HOTSPOT_POWER_TRACE_PATH =
+    "./hotspot_files/gcc.ptrace";
+static constexpr char const *HOTSPOT_TEMP_TRACE_PATH =
+    "./hotspot_files/outputs/gcc.ttrace";
+static constexpr char const *DVS_INSERT_INFORMATION_PATH =
+    "./DVSInsertionData.csv";
+static constexpr char const *EFFICIENCY_STATS_PATH = "./EfficiencyStatsNew.txt";
+
 char RegisterAccessPreRAPass::ID = 0;
 unsigned RegisterAccessPreRAPass::Processed = 0;
 unsigned RegisterAccessPreRAPass::Total = 0;
 ExtPathCollector RegisterAccessPreRAPass::PC = {};
+
+std::string cleanModuleName(char const *ModuleName) {
+  // Expecting module names to have (some file
+  // path)/gemm-file-name.pgo.merged.ll
+  static const std::regex Re(R"(([^/\\]+)\.pgo\.merged\.ll$)");
+
+  std::cmatch Match;
+  if (std::regex_search(ModuleName, Match, Re)) {
+    return Match[1].str();
+  }
+
+  return {};
+}
+
+void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
+  std::ifstream ReadFile = std::ifstream(FileName);
+
+  if (!ReadFile.is_open()) {
+    LLVM_DEBUG(errs() << "Failed to open hot spot config file for reading at "
+                      << FileName << "\n");
+    return;
+  }
+
+  std::vector<std::string> ConfigFileLines;
+  std::string Line;
+
+  //\t\t-sampling_intvl \tnumber
+  std::regex SamplingIntervalPattern(R"(\s*-sampling_intvl)");
+
+  while (std::getline(ReadFile, Line)) {
+    if (Line.size() == 0)
+      continue;
+
+    if (std::regex_search(Line, SamplingIntervalPattern)) {
+      // Rewrite line
+      Line = std::string("\t\t-sampling_intvl\t") +
+             std::to_string(Config.TimePerSample);
+    }
+
+    ConfigFileLines.push_back(Line);
+  }
+
+  ReadFile.close();
+
+  // Re-write back out to file
+  // TODO: could be much faster
+  std::ofstream WriteFile = std::ofstream(FileName);
+
+  if (!WriteFile.is_open()) {
+    LLVM_DEBUG(errs() << "Failed to open hot spot config file for writing at "
+                      << FileName << "\n");
+    return;
+  }
+
+  for (std::string const &Line : ConfigFileLines) {
+    WriteFile << Line << "\n";
+  }
+
+  WriteFile.close();
+}
 
 std::vector<ExtVFPair> teiGetSFVVCandidates(float TempKelvin,
                                             ExtConfigData const &Config) {
@@ -263,6 +340,40 @@ ExtHotSpotUnitName hotSpotStringToUnitName(std::string Name) {
   return ExtHotSpotUnitName::__LAST;
 }
 
+ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
+                               ExtMcPATOutput const &Power,
+                               ExtBBStats const &Stats,
+                               ExtHotSpotTempTrace const &InitialTrace,
+                               ExtConfigData const &Config) {
+  ExtHotSpotConfig HotSpotConfig = ExtHotSpotConfig{};
+  HotSpotConfig.TimePerSample = Stats.Cycles / Power.ClockRateHz;
+  editHotSpotConfig(HotSpotConfig, HOTSPOT_CONFIG_FILE_PATH);
+
+  ExtHotSpotFloorplan Floorplan = readHotSpotFloorplan(HOTSPOT_FLOORPLAN_PATH);
+
+  // Write gcc.init
+  writeHotSpotTempInit(InitialTrace, HOTSPOT_GCC_INIT_PATH);
+  // Write gcc.ptrace
+  ExtHotSpotPowerInput PowerInput =
+      mapMcPATPowerToHotspotPower(Power, Floorplan, Config);
+  writeHotSpotPowerTrace(PowerInput, HOTSPOT_POWER_TRACE_PATH);
+
+  // Run hotspot
+  // TODO: system command for ./run_hotspot.sh true
+  std::string Command = "./run_hotspot.sh true";
+
+  int Ret = std::system(Command.c_str());
+
+  if (Ret != 0) {
+    LLVM_DEBUG(dbgs() << "Running HotSpot failed on: " << ProgramName << "\n");
+  }
+
+  // Read output temperature trace
+  ExtHotSpotTempTrace TempTrace = readHotSpotTempTrace(HOTSPOT_TEMP_TRACE_PATH);
+
+  return TempTrace;
+}
+
 ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
   std::ifstream File(FileName);
 
@@ -303,6 +414,18 @@ ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
 
       Trace.Temps.at(static_cast<uint32_t>(UnitName)).push_back(Temp);
     }
+  }
+
+  return Trace;
+}
+
+ExtHotSpotTempTrace initDefaultHotSpotTrace(float AssumedTemperatureKelvin) {
+  ExtHotSpotTempTrace Trace = ExtHotSpotTempTrace{};
+
+  for (uint32_t i = 0; i < static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
+       i++) {
+    std::vector<float> Reading = std::vector<float>({AssumedTemperatureKelvin});
+    Trace.Temps.push_back(Reading);
   }
 
   return Trace;
@@ -405,6 +528,53 @@ void writeHotSpotTempInit(ExtHotSpotTempTrace PreviousTrace,
     // TODO: use an area-weighted average for Inode temperatures
     File << "inode_" << i << "\t" << 350.0f << "\n";
   }
+}
+
+float peakTemp(ExtHotSpotTempTrace const &TempTrace) {
+  float MaxReading = 0.0f;
+
+  for (std::vector<float> const &Reading : TempTrace.Temps) {
+    for (float Temp : Reading) {
+      MaxReading = std::max(MaxReading, Temp);
+    }
+  }
+
+  return MaxReading;
+}
+
+float areaWeightedCoreTemp(ExtHotSpotTempTrace const &TempTrace,
+                           ExtHotSpotFloorplan const &Flp) {
+  float MaxReading = 0.0f;
+
+  for (std::vector<float> const &Reading : TempTrace.Temps) {
+    float TotalArea = 0.0f;
+    float AreaWeightedTemp = 0.0f;
+
+    // Get total area
+    for (ExtHotSpotUnitName Unit = ExtHotSpotUnitName::__FIRST;
+         Unit < ExtHotSpotUnitName::__LAST;
+         Unit =
+             static_cast<ExtHotSpotUnitName>(static_cast<uint32_t>(Unit) + 1)) {
+      float UnitArea = getAreaHotSpotFlp(Flp, Unit);
+
+      TotalArea += UnitArea;
+    }
+
+    // Get area-weighted core temp now
+    for (ExtHotSpotUnitName Unit = ExtHotSpotUnitName::__FIRST;
+         Unit < ExtHotSpotUnitName::__LAST;
+         Unit =
+             static_cast<ExtHotSpotUnitName>(static_cast<uint32_t>(Unit) + 1)) {
+      float UnitArea = getAreaHotSpotFlp(Flp, Unit);
+      float UnitTemp = Reading[static_cast<uint32_t>(Unit)];
+
+      AreaWeightedTemp += UnitTemp * UnitArea / TotalArea;
+    }
+
+    MaxReading = std::max(AreaWeightedTemp, MaxReading);
+  };
+
+  return MaxReading;
 }
 
 ExtHotSpotTempInit readHotSpotTempInit(char const *FileName) {
@@ -777,13 +947,13 @@ std::string extBBHeaders() {
 }
 
 void ExtPathCollector::buildCriticalPath() {
-  std::error_code EC;
-  raw_fd_ostream OutFile("reg_stats.csv", EC, sys::fs::OF_Append);
-
-  if (EC) {
-    errs() << "Error opening file: " << EC.message() << "\n";
-    return;
-  }
+  // std::error_code EC;
+  // raw_fd_ostream OutFile("reg_stats.csv", EC, sys::fs::OF_Append);
+  //
+  // if (EC) {
+  //   errs() << "Error opening file: " << EC.message() << "\n";
+  //   return;
+  // }
 
   LLVM_DEBUG(dbgs() << "Finalising global adjacency list\n");
 
@@ -1080,7 +1250,6 @@ void ExtPathCollector::buildCriticalPath() {
   // - else get the successor with maximum accumulated weight
   //    - add entire sub-tree
   std::vector<std::vector<int>> AllSubgraphs;
-  std::vector<std::vector<int>> SCCsInSubgraph;
   std::vector<std::vector<int>> SubgraphLeaves;
 
   // While all nodes are not in a sub-graph
@@ -1250,83 +1419,6 @@ void ExtPathCollector::buildCriticalPath() {
   }
 
   DisjointSubgraphBlocks = SubgraphMBBList;
-}
-
-std::vector<ExtBBStats> extProfileToBBStats(StringRef fileName) {
-  std::vector<ExtBBStats> results;
-
-  ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
-      MemoryBuffer::getFile(fileName);
-
-  if (!BufferOrErr) {
-    errs()
-        << "Failed to open file with profiling data. Not created yet? Error: "
-        << BufferOrErr.getError().message() << "\n";
-    return results;
-  }
-
-  MemoryBuffer &Buffer = **BufferOrErr;
-  StringRef Content = Buffer.getBuffer();
-
-  std::vector<std::vector<std::string>> CSVMatrix;
-
-  while (!Content.empty()) {
-    StringRef Line;
-    std::tie(Line, Content) = Content.split("\n");
-    Line = Line.rtrim("\r\n");
-
-    std::vector<std::string> Fields;
-
-    while (!Line.empty()) {
-      StringRef Field;
-      std::tie(Field, Line) = Line.split(",");
-      Fields.push_back(Field.str());
-    }
-
-    CSVMatrix.push_back(std::move(Fields));
-  }
-
-  // With CSV matrix, need to parse
-  // expected columsn
-  // file, function_name, block_number, count
-  std::vector<std::string> const &ColumnNames = CSVMatrix[0];
-
-  LLVM_DEBUG(dbgs() << "Got columns of profdata.csv as: ");
-
-  for (uint64_t i = 0; i < ColumnNames.size(); i++) {
-    if (i > 0) {
-      LLVM_DEBUG(dbgs() << ", ");
-    }
-
-    LLVM_DEBUG(dbgs() << ColumnNames[i]);
-  }
-
-  for (int i = 1; i < CSVMatrix.size(); i++) {
-    std::vector<std::string> Row = CSVMatrix[i];
-
-    // TODO: the file name is not the same as the module name
-    // module name is something akin to objects/gemm.ll, file name is gemm.c
-    std::string FileName = Row[0];
-    std::string FunctionName = Row[1];
-    // TODO: this block name is actualy a block number, and we don't have a
-    // great mapping
-    std::string BlockName = Row[2];
-    std::string CycleCount = Row[3];
-
-    int CycleCountInt = std::stoi(CycleCount);
-
-    ExtBBStats ProfStats;
-    // TODO: bad mapping! not correct!
-    ProfStats.ModuleName = FileName;
-    ProfStats.FunctionName = FunctionName;
-    // TODO: bad mapping! not correct!
-    ProfStats.Name = BlockName;
-    ProfStats.Cycles = CycleCountInt;
-
-    results.push_back(ProfStats);
-  }
-
-  return results;
 }
 
 void ExtPathCollector::outputCriticalPath() {
@@ -1598,9 +1690,6 @@ void ExtPathCollector::outputCriticalPath() {
       Freq += BlockStat.Freq;
       GlobalFreq += BlockStat.GlobalFreq;
       Reads += ReadsFreq;
-      // LLVM_DEBUG(dbgs() << "Loads before: " << Loads << ", adding: " <<
-      // BlockStat.Loads << ", times " << BlockStat.Freq << ", to get: " <<
-      // BlockStat.Loads * BlockStat.Freq << "\n");
       Loads += LoadsFreq;
       Stores += StoresFreq;
       Instrs += InstrsFreq;
@@ -1635,14 +1724,8 @@ void ExtPathCollector::outputCriticalPath() {
         ModuleName = BlockStat.ModuleName;
       }
     }
-
-    // OPT: can just not print below a million cycles for cleaner output
-    if (Cycles < 1e6) {
-      // continue;
-    }
   }
 
-  // TODO: write path CFG, a CFG related strictly to our program paths
   // Cache for the total execution cycles of a given subgraph
   std::vector<float> SubgraphExitExecutionFrequency = {};
   for (unsigned i = 0; i < PotentialExitBlocks.size(); i++) {
@@ -1669,7 +1752,6 @@ void ExtPathCollector::outputCriticalPath() {
   // 4. consider execution frequency of the exit block to be the weight, take it
   // over our total weight to find probability
   // Need mapping BlockID -> Subgraph (PathIndexOfBlock)
-  // // TODO: code is not running? Not outputtig?
   for (unsigned u = 0; u < GlobalAdjacencyList.size(); u++) {
     std::vector<unsigned> const &Neighbours = GlobalAdjacencyList[u];
     unsigned StartBlock = u;
@@ -1774,6 +1856,7 @@ void ExtPathCollector::outputCriticalPath() {
   for (unsigned i = 0; i < TopoSortedComp.size(); i++) {
     unsigned Comp = TopoSortedComp[i];
 
+    // Grab module name off one of the blocks
     for (unsigned BlockID = 0; BlockID < CompIDs.size(); BlockID++) {
       if (CompIDs[BlockID] == Comp) {
         ModuleName = BlockStats[BlockID].ModuleName;
@@ -2873,11 +2956,11 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
     LLVM_DEBUG(dbgs() << "MBFI wrapper is nullptr\n");
 
     return false;
-  } else {
-    MBFI = &MBFIWrapper->getMBFI();
-
-    LLVM_DEBUG(dbgs() << "MBFI wrapper is not nullptr\n");
   }
+
+  MBFI = &MBFIWrapper->getMBFI();
+
+  LLVM_DEBUG(dbgs() << "MBFI wrapper is not nullptr\n");
 
   if (MBPIWrapper == nullptr) {
     LLVM_DEBUG(dbgs() << "MBPI wrapper is nullptr\n");
@@ -2888,15 +2971,11 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
   }
 
   // assign local ID to each block
-  // TODO: is Blocks ever used?
+  // TODO: is Blocks ever used? -- yes adjacency list, but maybe can use
+  // something else
   std::vector<MachineBasicBlock *> Blocks;
   std::unordered_map<MachineBasicBlock *, unsigned> BlockIDs;
   Blocks.reserve(MF.size());
-
-  // TODO: note manually disabled profData for now, we will rely on LLVM
-  // correctly using the profdata we passed
-  // std::vector<ExtBBStats> profData = extProfileToBBStats("outprof.csv");
-  std::vector<ExtBBStats> profData = {};
 
   unsigned BlockID = 0;
   for (auto &MBB : MF) {
@@ -3102,49 +3181,6 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
     BlockStat.Freq = std::max(BlockStat.Freq, 1.0);
     BlockStat.GlobalFreq = std::max(BlockStat.GlobalFreq, 1.0);
 
-    // TODO: don't need this code anymore, we put in the profile count into
-    // the code itself
-    bool FoundProfileData = false;
-
-    for (int i = 0; i < profData.size(); i++) {
-      ExtBBStats ProfileBlockStat = profData[i];
-      std::string FileName = BlockStat.ModuleName.substr(
-          BlockStat.ModuleName.find_last_of('/') + 1);
-
-      LLVM_DEBUG(dbgs() << "Getting block ID from " << ProfileBlockStat.Name
-                        << "\n");
-      int ProfileBlockID = std::stoi(ProfileBlockStat.Name);
-
-      bool BlockIndexMatch = ProfileBlockID == BlockID;
-      bool FunctionMatch =
-          ProfileBlockStat.FunctionName == BlockStat.FunctionName;
-      // TODO: module match... but difficult!
-      // use some regex pattern
-
-      if (BlockIndexMatch && FunctionMatch) {
-        LLVM_DEBUG(dbgs() << "Using profile data for block with name "
-                          << BlockStat.Name << ", function "
-                          << BlockStat.FunctionName << ", file " << FileName
-                          << "\n");
-        BlockStat.Cycles = ProfileBlockStat.Cycles;
-        FoundProfileData = true;
-        break;
-      } else {
-        LLVM_DEBUG(dbgs() << "Failed to match: Name - " << BlockStat.Name
-                          << " :: " << ProfileBlockStat.Name << ", "
-                          << BlockStat.FunctionName << " :: "
-                          << ProfileBlockStat.FunctionName << ", " << FileName
-                          << " :: " << ProfileBlockStat.FunctionName << "\n");
-      }
-    }
-
-    // NOTE: disabled since not used
-    if (!FoundProfileData && false) {
-      LLVM_DEBUG(dbgs() << "Couldn't find profile data for block "
-                        << BlockStat.Name << ", " << BlockStat.FunctionName
-                        << ", " << BlockStat.ModuleName << "\n");
-    }
-
     BlockID++;
   }
 
@@ -3171,14 +3207,490 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
 
   ++Processed;
   if (Processed == Total) {
-    // TODO: perform critical path computation
     LLVM_DEBUG(dbgs() << "Perform critical path computation now...\n");
 
     PC.buildCriticalPath();
     PC.outputCriticalPath();
+
+    std::string ModuleNameString = ModuleName.str();
+
+    if (cleanModuleName(ModuleNameString.c_str()).empty()) {
+      LLVM_DEBUG(dbgs() << "Skipping full-analysis, guessing that file "
+                        << ModuleNameString
+                        << " is not the full merged module to analyse\n");
+
+      return false;
+    }
+
+    LLVM_DEBUG(dbgs() << "Running our full analysis (in-path now)...\n");
+
+    // TODO: read from file
+    ExtConfigData ConfigData = ExtConfigData{};
+    ExtFinalAnalysisContext ETCRun = createAnalysisContext(PC);
+    ExtFinalAnalysisContext BaselineRun = createAnalysisContext(PC);
+
+    // Run with/without baseline
+    performFullAnalysis(ETCRun, ConfigData, false);
+    performFullAnalysis(BaselineRun, ConfigData, true);
+
+    // Evaluate performance differences
+    evaluatePerformanceAndOutput(ETCRun, BaselineRun, ConfigData,
+                                 EFFICIENCY_STATS_PATH);
   }
 
   return false;
+}
+
+// TODO: make constexpr
+static inline float celsiusToKelvin(float Celsius) { return Celsius + 273.15; }
+static inline float percentChange(float Original, float New) {
+  return (New - Original) / Original * 100.0f;
+}
+
+ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
+                                    ExtHotSpotTempTrace const &TempTrace,
+                                    ExtBBStats const &Stats) {
+  ExtOutputStats Output;
+  Output.Cycles = Stats.Cycles;
+  Output.Instructions = Stats.InstrCount;
+
+  Output.Frequency = McPAT.ClockRateHz;
+  Output.Voltage = McPAT.Voltage;
+  Output.Power = getPowerMcPAT(McPAT, ExtMcPATUnitName::CORE);
+
+  Output.Time = Output.Cycles / Output.Frequency;
+  Output.Energy = Output.Power * Output.Time;
+  Output.EnergyDelayProduct = Output.Energy * Output.Time;
+  Output.IPS = Output.Instructions / Output.Time;
+
+  return Output;
+}
+
+ExtOutputStats
+combineOutputStats(std::vector<ExtOutputStats> const &OutputStats) {
+  ExtOutputStats Output;
+
+  for (ExtOutputStats const &Stats : OutputStats) {
+    Output.Cycles += Stats.Cycles;
+    Output.Instructions += Stats.Instructions;
+    Output.Time += Stats.Time;
+    Output.Energy += Stats.Energy;
+
+    // Time-weighted averages
+    Output.Frequency += Stats.Frequency * Stats.Time;
+    Output.Voltage += Stats.Voltage * Stats.Time;
+    Output.IPS += Stats.IPS * Stats.Time;
+    Output.Power += Stats.Power * Stats.Time;
+  }
+
+  // Fix time-weighted averages
+  Output.Frequency /= Output.Time;
+  Output.Voltage /= Output.Time;
+  Output.IPS /= Output.Time;
+  Output.Power /= Output.Power;
+
+  // Calculate EDP
+  Output.EnergyDelayProduct = Output.Energy * Output.Time;
+
+  return Output;
+}
+
+void performFullAnalysis(ExtFinalAnalysisContext &Context,
+                         ExtConfigData const &Config, bool ForceBaseline) {
+  // We take as input
+  // - the list of topologically sorted subgraphs
+  // - for each candidate VF level
+  //  - we take the stats of each subgraph and create McPATInput
+  //  - we record the output for each VF level
+  //  - we compute optimal EDP
+  //  - we find every child subgraph from a global adjacency list on the
+  //  subgraphs
+  //  - we find the heat data (assumed recorded), take an aggregate
+  //  - we run hotspot, and record output heat data
+  //  - we loop if output heat data too hot (or if temperature violation found)
+  // - we finalise with the start, peak, and final temperature, vf configuration
+  // of each subgraph
+  //  - we output the required information to identify every start block, and
+  //  every internal end block
+  //  - we can then either insert the required vf changes into those blocks, or
+  //  insert additional header/ender blocks, find blocks that post/pre-dominate
+  //  etc.
+  std::vector<std::vector<ExtSubgraphID>> SubgraphPredecessors;
+
+  for (ExtSubgraphID SubgraphA = 0;
+       SubgraphA < Context.SubgraphAdjacencyList.size(); SubgraphA++) {
+    for (ExtSubgraphID SubgraphB : Context.SubgraphAdjacencyList[SubgraphA]) {
+      SubgraphPredecessors[SubgraphB].push_back(SubgraphA);
+    }
+  }
+
+  // Start by iterating in topological order
+  for (ExtSubgraphID SubgraphID : Context.TopoSortedSubgraphs) {
+    // Find heat (if exists)
+    // TODO: read from config
+    float AssumedTemperature =
+        celsiusToKelvin(Config.InitialTemperatureCelsius);
+
+    // Look at all predecessor subgraph IDs
+    std::vector<ExtSubgraphID> Predecessors = SubgraphPredecessors[SubgraphID];
+    std::vector<ExtHotSpotTempTrace> Traces;
+
+    for (ExtSubgraphID Predecessor : Predecessors) {
+      // Do they have heat information already calculated?
+      if (Context.SubgraphHotSpotFinalTemp[Predecessor].has_value()) {
+        Traces.push_back(*Context.SubgraphHotSpotFinalTemp[Predecessor]);
+      }
+    }
+
+    // Calculate average of collected previous traces
+    ExtHotSpotTempTrace AverageTrace;
+    if (Traces.size() > 0) {
+      AverageTrace = aggregateTracesAverage(Traces);
+    } else {
+      AverageTrace = initDefaultHotSpotTrace(AssumedTemperature);
+    }
+
+    std::vector<ExtVFPair> VFPairs = {};
+
+    if (ForceBaseline) {
+      ExtVFPair Baseline = ExtVFPair{};
+      Baseline.Voltage = Config.BaselineVoltage;
+      Baseline.FrequencyHz = Config.BaselineFrequencyGHz * 1.0e9f;
+      VFPairs = std::vector<ExtVFPair>({Baseline});
+    } else {
+      VFPairs = teiGetVFVVCandidates(AssumedTemperature, Config);
+    }
+
+    ExtVFPair BestConfiguration = ExtVFPair{};
+    float BestConfigurationEDP = INFINITY;
+
+    for (ExtVFPair VFPair : VFPairs) {
+      // Take sum of stats of this subgraph
+      ExtBBStats SubgraphStats = Context.SubgraphStats[SubgraphID];
+      ExtMcPatInput Input = blockStatsToMcPAT(
+          SubgraphID, VFPair.Voltage, VFPair.FrequencyHz, Config.NodeSize,
+          std::vector<ExtBBStats>({SubgraphStats}));
+
+      ExtMcPATOutput Output =
+          runMcPAT(cleanModuleName(SubgraphStats.ModuleName.c_str()), Input);
+
+      // Run hotspot
+      ExtHotSpotTempTrace OutputTemp =
+          runHotSpot(cleanModuleName(SubgraphStats.ModuleName.c_str()), Output,
+                     SubgraphStats, AverageTrace, Config);
+
+      Context.SubgraphHotSpotOutput[SubgraphID].push_back(OutputTemp);
+
+      // Check if temperature limits exceeded
+      if (peakTemp(OutputTemp) > Config.MaximumTemperatureKelvin) {
+        // Exclude candidate
+        continue;
+      }
+
+      // Calculate EDP
+      ExtOutputStats OutputStats =
+          calculateOutputStats(Output, OutputTemp, SubgraphStats);
+
+      if (OutputStats.EnergyDelayProduct < BestConfigurationEDP) {
+        BestConfigurationEDP = OutputStats.EnergyDelayProduct;
+        BestConfiguration = VFPair;
+
+        Context.SubgraphHotSpotFinalTemp[SubgraphID] =
+            std::make_optional(OutputTemp);
+        Context.SubgraphOutputStats[SubgraphID] =
+            std::make_optional(OutputStats);
+      }
+    }
+  }
+
+  // Output selected DVS levels
+  if (!ForceBaseline) {
+    writeDVSInformation(getBlockDVSInformation(Context), Config,
+                        DVS_INSERT_INFORMATION_PATH);
+  }
+}
+
+void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
+                                  ExtFinalAnalysisContext const &BaselineRun,
+                                  ExtConfigData const &ConfigData,
+                                  char const *FileName) {
+  // Get the output stats and combine
+  std::vector<ExtOutputStats> EtcOutput;
+  std::vector<ExtOutputStats> BaselineOutput;
+
+  for (auto const &OutputStat : ETCRun.SubgraphOutputStats) {
+    if (OutputStat.has_value()) {
+      EtcOutput.push_back(*OutputStat);
+    }
+  }
+
+  for (auto const &OutputStat : BaselineRun.SubgraphOutputStats) {
+    if (OutputStat.has_value()) {
+      BaselineOutput.push_back(*OutputStat);
+    }
+  }
+
+  ExtOutputStats ETCFinalOutput = combineOutputStats(EtcOutput);
+  ExtOutputStats BaselineFinalOutput = combineOutputStats(BaselineOutput);
+
+  // Compare EDP, IPS, Energy improvements, and output
+
+  // Decrease in EDP -> Better energy efficiency, hence the -
+  float EDPImprovement = -percentChange(BaselineFinalOutput.EnergyDelayProduct,
+                                        ETCFinalOutput.EnergyDelayProduct);
+  float IPSImprovement =
+      percentChange(BaselineFinalOutput.IPS, ETCFinalOutput.IPS);
+  float EnergyImprovement =
+      -percentChange(BaselineFinalOutput.Energy, ETCFinalOutput.Energy);
+
+  std::ofstream File = std::ofstream(FileName);
+
+  if (!File.is_open()) {
+    LLVM_DEBUG(errs() << "Failed to open output efficiency file" << "\n");
+
+    return;
+  }
+
+  File << "#ProgramName: "
+       << cleanModuleName(ETCRun.BlockStats[0].ModuleName.c_str()) << "\n";
+  File << "EDP%Improve:" << EDPImprovement << "\n";
+  File << "IPS%Improve:" << IPSImprovement << "\n";
+  File << "Energy%Improve:" << EnergyImprovement << "\n";
+
+  File.close();
+}
+
+std::vector<ExtBlockDVSInformation>
+getBlockDVSInformation(ExtFinalAnalysisContext const &Context) {
+  std::vector<ExtBlockDVSInformation> Result;
+
+  // Iterate each subgraph
+  for (ExtSubgraphID Subgraph = 0; Subgraph < Context.SubgraphBlocks.size();
+       Subgraph++) {
+    // Identify VF configuration applied
+    std::optional<ExtVFPair> VFPairOpt = Context.SubgraphBestVFPair[Subgraph];
+
+    if (!VFPairOpt.has_value()) {
+      continue;
+    }
+
+    ExtVFPair VFPair = *VFPairOpt;
+
+    // Iterate blocks of subgraph
+    for (ExtBlockID StartBlock : Context.SubgraphEntryBlocks[Subgraph]) {
+      ExtBBStats Stats = Context.BlockStats[StartBlock];
+
+      ExtBlockDVSInformation DVSInfo;
+      DVSInfo.Frequency = VFPair.FrequencyHz;
+      DVSInfo.Voltage = VFPair.Voltage;
+      DVSInfo.BlockStats = Stats;
+      DVSInfo.OutputStats = *Context.SubgraphOutputStats[Subgraph];
+    }
+  }
+
+  return Result;
+}
+
+int getVoltageIndex(ExtConfigData const &Config, float Voltage) {
+  for (uint32_t i = 0; i < Config.Voltages.size(); i++) {
+    if (Voltage == Config.Voltages[i])
+      return i;
+  }
+
+  // Didn't hit any level exactly, get closest
+  int ClosestLevel = -1;
+  float Distance = INFINITY;
+
+  for (uint32_t i = 0; i < Config.Voltages.size(); i++) {
+    float CurrentDistance = Voltage - Config.Voltages[i];
+    if (CurrentDistance < Distance) {
+      ClosestLevel = i;
+      Distance = CurrentDistance;
+    }
+  }
+
+  return ClosestLevel;
+}
+
+void writeDVSInformation(std::vector<ExtBlockDVSInformation> const &Information,
+                         ExtConfigData const &Config, char const *FileName) {
+  std::ofstream File = std::ofstream(FileName);
+
+  File << "function_name,local_block_id,voltage_level\n";
+
+  for (ExtBlockDVSInformation const &Block : Information) {
+    File << Block.BlockStats.FunctionName << ","
+         << Block.BlockStats.LocalBlockNumber << ","
+         << getVoltageIndex(Config, Block.Voltage) << "\n";
+  }
+
+  File.close();
+}
+
+ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC) {
+  ExtFinalAnalysisContext Context;
+
+  Context.BlockStats = PC.BlockStats;
+  Context.SubgraphBlocks = PC.DisjointSubgraphBlocks;
+  Context.SubgraphEntryBlocks = PC.PotentialStartBlocks;
+  Context.SubgraphInternalExitBlocks = PC.SubgraphInternalEndBlocks;
+
+  Context.SubgraphHotSpotOutput.resize(PC.DisjointSubgraphBlocks.size());
+  Context.SubgraphMcPATOutput.resize(PC.DisjointSubgraphBlocks.size());
+  Context.SubgraphHotSpotFinalTemp.resize(PC.DisjointSubgraphBlocks.size());
+  Context.SubgraphBestVFPair.resize(PC.DisjointSubgraphBlocks.size());
+  Context.SubgraphOutputStats.resize(PC.DisjointSubgraphBlocks.size());
+
+  // Build subgraph adjacency list from PC.DAGAdjacency
+  Context.SubgraphAdjacencyList =
+      std::vector<std::vector<ExtSubgraphID>>(PC.DisjointSubgraphBlocks.size());
+
+  // Need mapping component id -> subgraph
+  // have subgraph -> list{component}
+  std::vector<ExtSubgraphID> ComponentToSubgraph =
+      std::vector<ExtSubgraphID>(PC.BlocksInComp.size());
+  for (ExtSubgraphID Subgraph = 0; Subgraph < PC.SCCsInSubgraph.size();
+       Subgraph++) {
+    std::vector<int> const &Components = PC.SCCsInSubgraph[Subgraph];
+
+    for (int ComponentID : Components) {
+      ComponentToSubgraph[ComponentID] = Subgraph;
+    }
+  }
+
+  for (ExtComponentID CompA = 0; CompA < PC.BlocksInComp.size(); CompA++) {
+    for (ExtComponentID CompB = 0; CompB < PC.BlocksInComp.size(); CompB++) {
+      if (CompA == CompB)
+        continue;
+
+      ExtSubgraphID SubgraphA = ComponentToSubgraph[CompA];
+      ExtSubgraphID SubgraphB = ComponentToSubgraph[CompB];
+
+      // Don't add internal connections
+      if (SubgraphA == SubgraphB)
+        continue;
+
+      std::vector<int> const &NeighboursA = PC.DAGAdjacency[CompA];
+
+      if (std::find(NeighboursA.begin(), NeighboursA.end(), CompB) !=
+          NeighboursA.end()) {
+        // CompA -> CompB is a link; link indicates CompA is a dependency of
+        // CompB
+        Context.SubgraphAdjacencyList[SubgraphA].push_back(SubgraphB);
+      }
+    }
+  }
+
+  // Make all unique
+  for (ExtComponentID Subgraph = 0;
+       Subgraph < Context.SubgraphAdjacencyList.size(); Subgraph++) {
+    std::vector<ExtSubgraphID> &Neighbours =
+        Context.SubgraphAdjacencyList[Subgraph];
+
+    // Remove duplicates
+    std::sort(Neighbours.begin(), Neighbours.end());
+    // Unique moves consecutive duplicates to the end, then we remove
+    Neighbours.erase(std::unique(Neighbours.begin(), Neighbours.end()),
+                     Neighbours.end());
+  }
+
+  // Topological sort
+  std::vector<int> DependencyCount =
+      std::vector<int>(Context.SubgraphAdjacencyList.size());
+
+  for (ExtSubgraphID SubgraphA = 0;
+       SubgraphA < Context.SubgraphAdjacencyList.size(); SubgraphA++) {
+    for (ExtSubgraphID SubgraphB : Context.SubgraphAdjacencyList[SubgraphA]) {
+      DependencyCount[SubgraphB]++;
+    }
+  }
+
+  std::stack<ExtSubgraphID> Stack;
+
+  // Add all roots
+  for (ExtSubgraphID Subgraph = 0;
+       Subgraph < Context.SubgraphAdjacencyList.size(); Subgraph++) {
+    if (DependencyCount[Subgraph] > 0)
+      continue;
+
+    Stack.push(Subgraph);
+  }
+
+  while (!Stack.empty()) {
+    ExtSubgraphID Current = Stack.top();
+    Context.TopoSortedSubgraphs.push_back(Current);
+    Stack.pop();
+
+    // We consider current to be fulfilled, go to all neighbours and remove a
+    // dependency
+    for (ExtSubgraphID Neighbour : Context.SubgraphAdjacencyList[Current]) {
+      DependencyCount[Neighbour]--;
+
+      if (DependencyCount[Neighbour] == 0) {
+        Stack.push(Neighbour);
+      }
+    }
+  }
+
+  // Check if we have any remaining entries that weren't added, and add them in
+  // order
+  for (ExtSubgraphID Subgraph = 0; Subgraph < DependencyCount.size();
+       Subgraph++) {
+    // Dependency was not fulfilled;
+    if (DependencyCount[Subgraph] > 0) {
+      LLVM_DEBUG(dbgs() << "[WARN] Subgraph topological sort was not perfect, "
+                           "will have some unfulfilled dependencies\n");
+      Context.TopoSortedSubgraphs.push_back(Subgraph);
+    }
+  }
+
+  // Sum up stats per subgraph
+  for (ExtSubgraphID Subgraph = 0;
+       Subgraph < Context.SubgraphAdjacencyList.size(); Subgraph++) {
+    ExtBBStats SubgraphStats = {};
+    SubgraphStats.LocalBlockNumber = -1;
+
+    // Get list of MBBs for subgraph
+    for (ExtBlockID BlockID : PC.DisjointSubgraphBlocks[Subgraph]) {
+      ExtBBStats Stats = PC.BlockStats[BlockID];
+
+      if (SubgraphStats.Name.size() == 0)
+        SubgraphStats.Name = Stats.Name;
+      if (SubgraphStats.FunctionName.size() == 0)
+        SubgraphStats.FunctionName = Stats.FunctionName;
+      if (SubgraphStats.ModuleName.size() == 0)
+        SubgraphStats.ModuleName = Stats.ModuleName;
+
+      SubgraphStats.Cycles = Stats.Cycles * Stats.Freq;
+      SubgraphStats.Freq = Stats.Freq;
+      SubgraphStats.GlobalFreq = Stats.GlobalFreq;
+      SubgraphStats.Loads = Stats.Loads * Stats.Freq;
+      SubgraphStats.Stores = Stats.Stores * Stats.Freq;
+      SubgraphStats.Spills = Stats.Spills * Stats.Freq;
+      SubgraphStats.Reloads = Stats.Reloads * Stats.Freq;
+      SubgraphStats.Reads = Stats.Reads * Stats.Freq;
+      SubgraphStats.Writes = Stats.Writes * Stats.Freq;
+      SubgraphStats.InstrCount = Stats.InstrCount * Stats.Freq;
+      SubgraphStats.IntInstrCount = Stats.IntInstrCount * Stats.Freq;
+      SubgraphStats.FloatInstrCount = Stats.FloatInstrCount * Stats.Freq;
+      SubgraphStats.BranchInstrCount = Stats.BranchInstrCount * Stats.Freq;
+      SubgraphStats.LoadStoreInstrCount =
+          Stats.LoadStoreInstrCount * Stats.Freq;
+      SubgraphStats.FunctionCalls = Stats.FunctionCalls * Stats.Freq;
+      SubgraphStats.ContextSwitches = Stats.ContextSwitches * Stats.Freq;
+      SubgraphStats.MulAccess = Stats.MulAccess * Stats.Freq;
+      SubgraphStats.FPAccess = Stats.FPAccess * Stats.Freq;
+      SubgraphStats.IntALUAccess = Stats.IntALUAccess * Stats.Freq;
+      SubgraphStats.IntRegfileReads = Stats.IntRegfileReads * Stats.Freq;
+      SubgraphStats.FloatRegfileReads = Stats.FloatRegfileReads * Stats.Freq;
+      SubgraphStats.IntRegfileWrites = Stats.IntRegfileWrites * Stats.Freq;
+      SubgraphStats.FloatRegfileWrites = Stats.FloatRegfileWrites * Stats.Freq;
+    }
+
+    Context.SubgraphStats.push_back(SubgraphStats);
+  }
+
+  return Context;
 }
 } // namespace llvm
 
