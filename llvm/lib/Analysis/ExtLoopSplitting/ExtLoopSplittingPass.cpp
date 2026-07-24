@@ -108,6 +108,9 @@ bool extTileLoop(Loop *L, LoopInfo *LI, uint64_t tileConstant) {
 char ExtLoopSplittingPass::ID = 0;
 
 bool ExtLoopSplittingPass::runOnLoop(Loop *L, LPPassManager &LPM) {
+  // TODO: disabled for now because causing issues?
+  return false;
+
   LLVM_DEBUG(dbgs() << "[LoopSplittingPass] Running on loop: ");
 
   BasicBlock *Header = L->getHeader();

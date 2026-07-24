@@ -55,11 +55,253 @@ static constexpr char const *HOTSPOT_TEMP_TRACE_PATH =
 static constexpr char const *DVS_INSERT_INFORMATION_PATH =
     "./DVSInsertionData.csv";
 static constexpr char const *EFFICIENCY_STATS_PATH = "./EfficiencyStatsNew.txt";
+static constexpr char const *CONFIG_NEW_PATH = "./scripts/config_new.cfg";
 
 char RegisterAccessPreRAPass::ID = 0;
 unsigned RegisterAccessPreRAPass::Processed = 0;
 unsigned RegisterAccessPreRAPass::Total = 0;
 ExtPathCollector RegisterAccessPreRAPass::PC = {};
+
+static float getAreaHotSpotFlp(ExtHotSpotFloorplan Flp,
+                               ExtHotSpotUnitName Name) {
+  return Flp
+      .Units[static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(Name)]
+      .Area;
+}
+
+static float &getPowerHotSpot(ExtHotSpotPowerInput &Power,
+                              ExtHotSpotUnitName Name) {
+  return Power
+      .UnitPower[static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(Name)];
+}
+
+static float getPowerHotSpot(ExtHotSpotPowerInput const &Power,
+                             ExtHotSpotUnitName Name) {
+  return Power
+      .UnitPower[static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(Name)];
+}
+
+static std::string trimWhitespace(const std::string &Str) {
+  const std::string Whitespace = " \t\r\n";
+
+  const size_t Begin = Str.find_first_not_of(Whitespace);
+  if (Begin == std::string::npos)
+    return "";
+
+  const size_t End = Str.find_last_not_of(Whitespace);
+
+  return Str.substr(Begin, End - Begin + 1);
+}
+
+static bool parseBoolAlpha(const std::string &Value, bool &Result) {
+  std::string LowerValue;
+
+  for (char C : Value) {
+    LowerValue +=
+        static_cast<char>(std::tolower(static_cast<unsigned char>(C)));
+  }
+
+  if (LowerValue == "true") {
+    Result = true;
+    return true;
+  }
+
+  if (LowerValue == "false") {
+    Result = false;
+    return true;
+  }
+
+  return false;
+}
+
+ExtConfigData readConfigData(const char *FileName) {
+  ExtConfigData Config{};
+
+  std::ifstream File(FileName);
+
+  if (!File.is_open()) {
+    LLVM_DEBUG(errs() << "Failed to open config data file: " << FileName
+                      << "\n");
+
+    return Config;
+  }
+
+  std::string Line;
+  unsigned LineNumber = 0;
+
+  while (std::getline(File, Line)) {
+    ++LineNumber;
+
+    // Remove comments
+    const size_t CommentPosition = Line.find('#');
+
+    if (CommentPosition != std::string::npos)
+      Line.erase(CommentPosition);
+
+    Line = trimWhitespace(Line);
+
+    // Ignore empty lines and comment-only lines
+    if (Line.empty())
+      continue;
+
+    const size_t EqualsPosition = Line.find('=');
+
+    if (EqualsPosition == std::string::npos) {
+      LLVM_DEBUG(errs() << "Ignoring malformed config line " << LineNumber
+                        << ": " << Line << "\n");
+      continue;
+    }
+
+    const std::string Key = trimWhitespace(Line.substr(0, EqualsPosition));
+    const std::string Value = trimWhitespace(Line.substr(EqualsPosition + 1));
+
+    if (Key.empty() || Value.empty()) {
+      LLVM_DEBUG(errs() << "Ignoring malformed config line " << LineNumber
+                        << ": " << Line << "\n");
+      continue;
+    }
+
+    // Boolean key/values
+    if (Key == "ALLOW_VARIABLE_FREQUENCY") {
+      bool ParsedValue;
+
+      if (!parseBoolAlpha(Value, ParsedValue)) {
+        LLVM_DEBUG(errs() << "Invalid boolean value for " << Key << " on line "
+                          << LineNumber << "\n");
+        continue;
+      }
+
+      Config.VaryFrequency = ParsedValue;
+
+      continue;
+    }
+
+    if (Key == "USE_CACHED_POWER_OUTPUTS") {
+      bool ParsedValue;
+
+      if (!parseBoolAlpha(Value, ParsedValue)) {
+        LLVM_DEBUG(errs() << "Invalid boolean value for " << Key << " on line "
+                          << LineNumber << "\n");
+        continue;
+      }
+
+      Config.UseCachedPowerOutputs = ParsedValue;
+      continue;
+    }
+
+    if (Key == "ATTEMPT_TEMPERATURE_OPTIM") {
+      bool ParsedValue;
+
+      if (!parseBoolAlpha(Value, ParsedValue)) {
+        LLVM_DEBUG(errs() << "Invalid boolean value for " << Key << " on line "
+                          << LineNumber << "\n");
+        continue;
+      }
+
+      Config.AdjustVoltageWhenCold = ParsedValue;
+
+      continue;
+    }
+
+    // Numerical values
+    // TODO: some error-check on invalid values?
+
+    if (Key == "CLOCK_RATE_MHZ") {
+      const float ClockRateMHz = std::stof(Value);
+
+      Config.BaselineFrequencyGHz = ClockRateMHz / 1000.0f;
+
+      continue;
+    }
+
+    if (Key == "NODE_SIZE") {
+      Config.NodeSize = std::stoi(Value);
+
+      continue;
+    }
+
+    if (Key == "HEATSINK_OFFSET") {
+      Config.HeatsinkOffset = std::stof(Value);
+
+      continue;
+    }
+
+    if (Key == "NUM_SAMPLES_HOTSPOT") {
+      Config.NumSamplesHotSpot = static_cast<uint32_t>(std::stoul(Value));
+
+      continue;
+    }
+
+    if (Key == "BASELINE_VOLTAGE_LEVEL") {
+      Config.BaselineVoltage = std::stof(Value);
+
+      continue;
+    }
+
+    if (Key == "VOLTAGE_UPWARDS_ADJUSTMENT") {
+      Config.ColdVoltageAdjustment = std::stof(Value);
+
+      continue;
+    }
+
+    if (Key == "TEMP_LOW") {
+      Config.ColdTemperatureKelvin = std::stof(Value);
+
+      continue;
+    }
+
+    if (Key == "TEMP_SAFEGUARD_MAX") {
+      Config.MaximumTemperatureKelvin = std::stof(Value);
+
+      continue;
+    }
+
+    if (Key == "FREQUENCY_STEP_GHZ") {
+      Config.FrequencyStepGHz = std::stof(Value);
+
+      continue;
+    }
+
+    if (Key == "FREQUENCY_LIMIT_GHZ") {
+      const float FrequencyLimitGHz = std::stof(Value);
+
+      // Store/use as required.
+      Config.MaximumFrequencyGHz = FrequencyLimitGHz;
+
+      continue;
+    }
+
+    // Load up to 10 voltage values
+    if (Key.size() >= 2 && Key[0] == 'V') {
+      const unsigned Index = static_cast<unsigned>(std::stoul(Key.substr(1)));
+
+      if (Index <= 10) {
+        const float Voltage = std::stof(Value);
+
+        if (Index >= Config.Voltages.size())
+          Config.Voltages.resize(Index + 1);
+
+        Config.Voltages[Index] = Voltage;
+
+        continue;
+      }
+    }
+
+    LLVM_DEBUG(errs() << "Unknown configuration key on line " << LineNumber
+                      << ": " << Key << "\n");
+  }
+
+  // Generate frequency list
+  Config.FrequenciesGHz.clear();
+
+  for (float Frequency = Config.BaselineFrequencyGHz;
+       Frequency <= Config.MaximumFrequencyGHz;
+       Frequency += Config.FrequencyStepGHz) {
+    Config.FrequenciesGHz.push_back(Frequency);
+  }
+
+  return Config;
+}
 
 std::string cleanModuleName(char const *ModuleName) {
   // Expecting module names to have (some file
@@ -94,9 +336,17 @@ void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
       continue;
 
     if (std::regex_search(Line, SamplingIntervalPattern)) {
+      float Time = Config.TimePerSample;
+
+      if (Time < 1.0e-9f) {
+        Time = 1.0e-9f;
+      }
+
+      std::ostringstream Oss;
+      Oss << std::scientific << std::setprecision(6) << Time;
+
       // Rewrite line
-      Line = std::string("\t\t-sampling_intvl\t") +
-             std::to_string(Config.TimePerSample);
+      Line = std::string("\t\t-sampling_intvl\t") + Oss.str();
     }
 
     ConfigFileLines.push_back(Line);
@@ -121,34 +371,30 @@ void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
   WriteFile.close();
 }
 
-std::vector<ExtVFPair> teiGetSFVVCandidates(float TempKelvin,
-                                            ExtConfigData const &Config) {
-  // Target frequency is baseline
-  float MinimumVoltage = teiVoltageToDiscreteLevel(
-      teiGetVoltage(TempKelvin, Config.BaselineFrequencyGHz * 1.0e9f), Config);
-
-  ExtVFPair Pair;
-  Pair.Voltage = MinimumVoltage;
-  Pair.FrequencyHz = Config.BaselineFrequencyGHz * 1.0e9f;
-
-  // TODO: we can add the other criteria, like if temperature is too low we try
-  // to adjust voltage up
-
-  return std::vector<ExtVFPair>({Pair});
-}
-
-std::vector<ExtVFPair> teiGetVFVVCandidates(float TempKelvin,
-                                            ExtConfigData const &Config) {
+std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
+                                        ExtConfigData const &Config) {
   std::vector<ExtVFPair> UnfilteredResults;
 
   for (uint32_t i = 0; i < Config.FrequenciesGHz.size(); i++) {
     float FrequencyHz = Config.FrequenciesGHz[i] * 1.0e9f;
+    float VoltageAdjustment = 0.0f;
+
+    if (Config.AdjustVoltageWhenCold &&
+        TempKelvin < Config.ColdTemperatureKelvin) {
+      VoltageAdjustment = Config.ColdVoltageAdjustment;
+    }
+
     float Voltage = teiVoltageToDiscreteLevel(
-        teiGetVoltage(TempKelvin, FrequencyHz), Config);
+        teiGetVoltage(TempKelvin, FrequencyHz) + VoltageAdjustment, Config);
 
     ExtVFPair Pair;
     Pair.FrequencyHz = FrequencyHz;
     Pair.Voltage = Voltage;
+
+    // If we're not allowed to vary frequency, set to baseline
+    if (!Config.VaryFrequency) {
+      Pair.FrequencyHz = Config.BaselineFrequencyGHz * 1.0e9f;
+    }
 
     UnfilteredResults.push_back(Pair);
   }
@@ -158,7 +404,7 @@ std::vector<ExtVFPair> teiGetVFVVCandidates(float TempKelvin,
   float PreviousVoltage = FLT_MAX;
   std::vector<ExtVFPair> Results;
 
-  for (uint32_t i = UnfilteredResults.size() - 1; i >= 0; i--) {
+  for (uint32_t i = UnfilteredResults.size(); --i;) {
     ExtVFPair Candidate = UnfilteredResults[i];
 
     // Candidate is of lower frequency (we iterate frequencies in descending
@@ -219,8 +465,8 @@ float teiGetVoltage(float TempKelvin, float FrequencyHz) {
 
 std::vector<std::string> splitString(std::string const &Str,
                                      std::string const &Delimiters) {
-  std::vector<std::string> Result;
-  std::string Current;
+  std::vector<std::string> Result{};
+  std::string Current{};
 
   for (char c : Str) {
     if (Delimiters.find(c) != std::string::npos) {
@@ -243,19 +489,6 @@ std::vector<std::string> splitString(std::string const &Str,
 bool stringStartsWith(std::string const &Str, std::string const &Prefix) {
   return Str.size() >= Prefix.size() &&
          Str.compare(0, Prefix.size(), Prefix) == 0;
-}
-
-static float getAreaHotSpotFlp(ExtHotSpotFloorplan Flp,
-                               ExtHotSpotUnitName Name) {
-  return Flp
-      .Units[static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(Name)]
-      .Area;
-}
-
-static float &getPowerHotSpot(ExtHotSpotPowerInput &Power,
-                              ExtHotSpotUnitName Name) {
-  return Power
-      .UnitPower[static_cast<std::underlying_type_t<ExtHotSpotUnitName>>(Name)];
 }
 
 char const *hotSpotUnitNameToString(ExtHotSpotUnitName Name) {
@@ -345,18 +578,26 @@ ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
                                ExtBBStats const &Stats,
                                ExtHotSpotTempTrace const &InitialTrace,
                                ExtConfigData const &Config) {
+  LLVM_DEBUG(dbgs() << "Preparing to run hotspot on: " << ProgramName << "\n");
+
   ExtHotSpotConfig HotSpotConfig = ExtHotSpotConfig{};
-  HotSpotConfig.TimePerSample = Stats.Cycles / Power.ClockRateHz;
+  HotSpotConfig.TimePerSample =
+      (Stats.Cycles / Power.ClockRateHz) / Config.NumSamplesHotSpot;
   editHotSpotConfig(HotSpotConfig, HOTSPOT_CONFIG_FILE_PATH);
 
+  LLVM_DEBUG(dbgs() << "Edited hot spot config; sample time: "
+                    << HotSpotConfig.TimePerSample << "\n");
+
   ExtHotSpotFloorplan Floorplan = readHotSpotFloorplan(HOTSPOT_FLOORPLAN_PATH);
+
+  LLVM_DEBUG(dbgs() << "Read hot spot floorplan\n");
 
   // Write gcc.init
   writeHotSpotTempInit(InitialTrace, HOTSPOT_GCC_INIT_PATH);
   // Write gcc.ptrace
   ExtHotSpotPowerInput PowerInput =
       mapMcPATPowerToHotspotPower(Power, Floorplan, Config);
-  writeHotSpotPowerTrace(PowerInput, HOTSPOT_POWER_TRACE_PATH);
+  writeHotSpotPowerTrace(PowerInput, Config, HOTSPOT_POWER_TRACE_PATH);
 
   // Run hotspot
   // TODO: system command for ./run_hotspot.sh true
@@ -378,6 +619,7 @@ ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
   std::ifstream File(FileName);
 
   ExtHotSpotTempTrace Trace;
+  Trace.Temps.resize(static_cast<std::size_t>(ExtHotSpotUnitName::__LAST));
 
   if (!File) {
     LLVM_DEBUG(errs() << "Failed to open file: " << FileName << "\n");
@@ -402,6 +644,13 @@ ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
       for (std::string Part : Parts) {
         ExtHotSpotUnitName UnitName = hotSpotStringToUnitName(Part);
 
+        if (UnitName == ExtHotSpotUnitName::__LAST) {
+          LLVM_DEBUG(
+              errs()
+              << "Failed to recognise one part; bad hot spot unit name! ["
+              << Part << "] Big problem!!!\n");
+        }
+
         UnitOrder.push_back(UnitName);
       }
 
@@ -416,43 +665,125 @@ ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
     }
   }
 
+  // Check all units got at least one reading
+  for (uint32_t UnitIndex = 0; UnitIndex < Trace.Temps.size(); UnitIndex++) {
+    std::vector<float> const &Reading = Trace.Temps[UnitIndex];
+
+    if (Reading.size() == 0) {
+      LLVM_DEBUG(
+          errs() << "HotSpot trace was missing reading values for unit index: "
+                 << UnitIndex << "\n");
+    }
+  }
+
   return Trace;
 }
 
 ExtHotSpotTempTrace initDefaultHotSpotTrace(float AssumedTemperatureKelvin) {
   ExtHotSpotTempTrace Trace = ExtHotSpotTempTrace{};
+  Trace.Temps.resize(static_cast<std::size_t>(ExtHotSpotUnitName::__LAST));
 
   for (uint32_t i = 0; i < static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
        i++) {
     std::vector<float> Reading = std::vector<float>({AssumedTemperatureKelvin});
-    Trace.Temps.push_back(Reading);
+    Trace.Temps[i] = Reading;
   }
 
   return Trace;
 }
 
-void writeHotSpotTempInit(float InitialTemperature, char const *FileName) {
-  std::ofstream File(FileName);
+void writeHotSpotPowerTrace(ExtHotSpotPowerInput const &Power,
+                            ExtConfigData const &Config, char const *FileName) {
+  // L2_left	L2	L2_right	Icache	Dcache	Bpred_0	Bpred_1	Bpred_2
+  // DTB_0	DTB_1	DTB_2	FPAdd_0	FPAdd_1	FPReg_0	FPReg_1	FPReg_2	FPReg_3
+  // FPMul_0	FPMul_1	FPMap_0	FPMap_1	IntMap	IntQ	IntReg_0	IntReg_1
+  // IntExec	FPQ	LdStQ	ITB_0	ITB_1
+  // unit names separated by tab
+  std::ofstream File = std::ofstream(FileName);
 
-  std::stringstream TempStream;
-  TempStream << std::fixed << std::setprecision(3) << InitialTemperature;
-  std::string TempString = TempStream.str();
-
-  for (uint32_t i = 0; i < static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
-       i++) {
-    ExtHotSpotUnitName UnitEnum = static_cast<ExtHotSpotUnitName>(i);
-
-    std::string Line = std::string(hotSpotUnitNameToString(UnitEnum)) + '\t' +
-                       TempString + '\n';
-    File << Line;
-    File << "hsp_" << Line;
-    File << "hsink_" << Line;
-    File << "iface_" << Line;
+  if (!File.is_open()) {
+    LLVM_DEBUG(errs() << "Failed to open power trace file\n");
   }
 
-  for (uint32_t i = 0; i < 12; i++) {
-    File << "inode_" << i << "\t" << TempString << "\n";
+  std::vector<ExtHotSpotUnitName> Ordering = {
+      ExtHotSpotUnitName::L2_LEFT,  ExtHotSpotUnitName::L2,
+      ExtHotSpotUnitName::L2_RIGHT, ExtHotSpotUnitName::ICACHE,
+      ExtHotSpotUnitName::DCACHE,   ExtHotSpotUnitName::BPRED_0,
+      ExtHotSpotUnitName::BPRED_1,  ExtHotSpotUnitName::BPRED_2,
+      ExtHotSpotUnitName::DTB_0,    ExtHotSpotUnitName::DTB_1,
+      ExtHotSpotUnitName::DTB_2,    ExtHotSpotUnitName::FPADD_0,
+      ExtHotSpotUnitName::FPADD_1,  ExtHotSpotUnitName::FPREG_0,
+      ExtHotSpotUnitName::FPREG_1,  ExtHotSpotUnitName::FPREG_2,
+      ExtHotSpotUnitName::FPREG_3,  ExtHotSpotUnitName::FPMUL_0,
+      ExtHotSpotUnitName::FPMUL_1,  ExtHotSpotUnitName::FPMAP_0,
+      ExtHotSpotUnitName::FPMAP_1,  ExtHotSpotUnitName::INTMAP,
+      ExtHotSpotUnitName::INTQ,     ExtHotSpotUnitName::INTREG_0,
+      ExtHotSpotUnitName::INTREG_1, ExtHotSpotUnitName::INTEXEC,
+      ExtHotSpotUnitName::FPQ,      ExtHotSpotUnitName::LDSTQ,
+      ExtHotSpotUnitName::ITB_0,    ExtHotSpotUnitName::ITB_1};
+
+  bool First = true;
+  for (ExtHotSpotUnitName UnitName : Ordering) {
+    if (!First) {
+      File << "\t";
+    }
+    First = false;
+
+    File << hotSpotUnitNameToString(UnitName);
   }
+
+  File << "\n";
+
+  for (uint32_t i = 0; i < Config.NumSamplesHotSpot; i++) {
+    bool First = true;
+    for (ExtHotSpotUnitName UnitName : Ordering) {
+      if (!First) {
+        File << "\t";
+      }
+      First = false;
+
+      File << getPowerHotSpot(Power, UnitName);
+    }
+
+    File << "\n";
+  }
+
+  File.close();
+}
+
+ExtHotSpotTempTrace
+aggregateTracesHottest(std::vector<ExtHotSpotTempTrace> const &Traces) {
+  if (Traces.size() == 0) {
+    LLVM_DEBUG(errs() << "Cannot aggregate 0 traces\n");
+  }
+
+  LLVM_DEBUG(dbgs() << "Performing aggregate on " << Traces.size()
+                    << " traces\n");
+
+  uint32_t NumUnits = static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
+
+  ExtHotSpotTempTrace Output{};
+  Output.Temps = std::vector<std::vector<float>>(NumUnits);
+
+  for (uint32_t UnitIndex = 0; UnitIndex < NumUnits; UnitIndex++) {
+    float HottestUnitTemp = 0.0f;
+
+    for (uint32_t i = 0; i < Traces.size(); i++) {
+      std::vector<float> const &PerSampleTemps = Traces[i].Temps[UnitIndex];
+
+      if (PerSampleTemps.size() == 0) {
+        LLVM_DEBUG(errs() << "For trace index " << i << " unit " << UnitIndex
+                          << " there were no samples available!\n");
+        continue;
+      }
+
+      HottestUnitTemp = std::max(HottestUnitTemp, PerSampleTemps.back());
+    }
+
+    Output.Temps.at(UnitIndex) = std::vector<float>({HottestUnitTemp});
+  }
+
+  return Output;
 }
 
 ExtHotSpotTempTrace
@@ -461,27 +792,31 @@ aggregateTracesAverage(std::vector<ExtHotSpotTempTrace> const &Traces) {
     LLVM_DEBUG(errs() << "Cannot aggregate 0 traces\n");
   }
 
-  uint32_t NumUnits = Traces[0].Temps.size();
+  LLVM_DEBUG(dbgs() << "Performing aggregate on " << Traces.size()
+                    << " traces\n");
 
-  ExtHotSpotTempTrace Output;
+  uint32_t NumUnits = static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
+
+  ExtHotSpotTempTrace Output{};
   Output.Temps = std::vector<std::vector<float>>(NumUnits);
 
   std::vector<float> TotalTempPerUnit = std::vector<float>(NumUnits);
 
-  for (uint32_t UnitIndex = 0; UnitIndex < Output.Temps.size(); UnitIndex++) {
+  for (uint32_t UnitIndex = 0; UnitIndex < NumUnits; UnitIndex++) {
+    // Taking average temperature for the given unit across all traces
     float TotalTemp = 0.0f;
 
     for (uint32_t i = 0; i < Traces.size(); i++) {
       std::vector<float> const &PerSampleTemps = Traces[i].Temps[UnitIndex];
-      float AverageReading = 0.0f;
 
-      for (float Reading : PerSampleTemps) {
-        AverageReading += Reading;
+      if (PerSampleTemps.size() == 0) {
+        LLVM_DEBUG(errs() << "For trace index " << i << " unit " << UnitIndex
+                          << " there were no samples available!\n");
+        continue;
       }
 
-      AverageReading /= static_cast<float>(PerSampleTemps.size());
-
-      TotalTemp += AverageReading;
+      // Take the latest sample
+      TotalTemp += PerSampleTemps.back();
     }
 
     Output.Temps.at(UnitIndex) =
@@ -495,44 +830,61 @@ void writeHotSpotTempInit(ExtHotSpotTempTrace PreviousTrace,
                           char const *FileName) {
   std::ofstream File(FileName);
 
-  File << std::fixed << std::setprecision(3);
+  File << std::setprecision(3);
 
-  for (uint32_t i = 0; i < static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
-       i++) {
-    ExtHotSpotUnitName UnitEnum = static_cast<ExtHotSpotUnitName>(i);
+  char const *Prefixes[4] = {"", "iface_", "hsp_", "hsink_"};
 
-    std::vector<float> TempReadings = PreviousTrace.Temps[i];
-    float AverageTemp = 0.0f;
+  // TODO: implement cleaner/more efficient way to do this
+  for (uint32_t j = 0; j < 4; j++) {
+    for (uint32_t i = 0; i < static_cast<uint32_t>(ExtHotSpotUnitName::__LAST);
+         i++) {
+      ExtHotSpotUnitName UnitEnum = static_cast<ExtHotSpotUnitName>(i);
 
-    for (float Reading : TempReadings) {
-      AverageTemp += Reading;
+      std::vector<float> TempReadings = PreviousTrace.Temps[i];
+      float AverageTemp = 0.0f;
+
+      for (float Reading : TempReadings) {
+        AverageTemp += Reading;
+      }
+
+      if (TempReadings.size() == 0) {
+        LLVM_DEBUG(
+            errs()
+            << "Reading temps of previous trace, but there were none!\n");
+      }
+
+      AverageTemp /= static_cast<float>(TempReadings.size());
+
+      std::stringstream TempStream;
+      TempStream << std::setprecision(5) << AverageTemp;
+
+      std::string Line = std::string(hotSpotUnitNameToString(UnitEnum)) + '\t' +
+                         TempStream.str() + '\n';
+      File << Prefixes[j] << Line;
+      // TODO: we assume all readings are same as unit temperature, but reality
+      // is likely slightly different?
+      // TODO: heatsink offset
+      // File << "hsp_" << Line;
+      // File << "hsink_" << Line;
+      // File << "iface_" << Line;
     }
-
-    AverageTemp /= static_cast<float>(TempReadings.size());
-
-    std::stringstream TempStream;
-    TempStream << std::fixed << std::setprecision(3) << AverageTemp;
-
-    std::string Line = std::string(hotSpotUnitNameToString(UnitEnum)) + '\t' +
-                       TempStream.str() + '\n';
-    File << Line;
-    // TODO: we assume all readings are same as unit temperature, but reality is
-    // likely slightly different?
-    // TODO: heatsink offset
-    File << "hsp_" << Line;
-    File << "hsink_" << Line;
-    File << "iface_" << Line;
   }
+
+  // TODO: should pass the floorplan as a variable
+  float AverageWeightedTemp = areaWeightedCoreTemp(
+      PreviousTrace, readHotSpotFloorplan(HOTSPOT_FLOORPLAN_PATH));
 
   for (uint32_t i = 0; i < 12; i++) {
     // TODO: use an area-weighted average for Inode temperatures
-    File << "inode_" << i << "\t" << 350.0f << "\n";
+    File << "inode_" << i << "\t" << std::setprecision(5) << AverageWeightedTemp
+         << "\n";
   }
 }
 
 float peakTemp(ExtHotSpotTempTrace const &TempTrace) {
   float MaxReading = 0.0f;
 
+  // For every unit, for every reading on that unit, get the maximum
   for (std::vector<float> const &Reading : TempTrace.Temps) {
     for (float Temp : Reading) {
       MaxReading = std::max(MaxReading, Temp);
@@ -544,37 +896,29 @@ float peakTemp(ExtHotSpotTempTrace const &TempTrace) {
 
 float areaWeightedCoreTemp(ExtHotSpotTempTrace const &TempTrace,
                            ExtHotSpotFloorplan const &Flp) {
-  float MaxReading = 0.0f;
+  // How this should work:
+  // TempTrace contains a vector of size units, each entry
+  // in this vector is a reading, at different sample time; really we should
+  // just take the last reading of each
 
-  for (std::vector<float> const &Reading : TempTrace.Temps) {
-    float TotalArea = 0.0f;
-    float AreaWeightedTemp = 0.0f;
+  float TotalArea = 0.0f;
+  float AreaWeightedTemp = 0.0f;
 
-    // Get total area
-    for (ExtHotSpotUnitName Unit = ExtHotSpotUnitName::__FIRST;
-         Unit < ExtHotSpotUnitName::__LAST;
-         Unit =
-             static_cast<ExtHotSpotUnitName>(static_cast<uint32_t>(Unit) + 1)) {
-      float UnitArea = getAreaHotSpotFlp(Flp, Unit);
+  for (ExtHotSpotUnitName Unit = ExtHotSpotUnitName::__FIRST;
+       Unit < ExtHotSpotUnitName::__LAST;
+       Unit =
+           static_cast<ExtHotSpotUnitName>(static_cast<uint32_t>(Unit) + 1)) {
+    // Reading area of this unit
+    float UnitArea = getAreaHotSpotFlp(Flp, Unit);
+    // Take the last temperature for each sample of the unit (TODO: customise so
+    // we can average/max/latest)
+    float LatestTemp = TempTrace.Temps.at(static_cast<uint32_t>(Unit)).back();
 
-      TotalArea += UnitArea;
-    }
+    TotalArea += UnitArea;
+    AreaWeightedTemp += LatestTemp * UnitArea;
+  }
 
-    // Get area-weighted core temp now
-    for (ExtHotSpotUnitName Unit = ExtHotSpotUnitName::__FIRST;
-         Unit < ExtHotSpotUnitName::__LAST;
-         Unit =
-             static_cast<ExtHotSpotUnitName>(static_cast<uint32_t>(Unit) + 1)) {
-      float UnitArea = getAreaHotSpotFlp(Flp, Unit);
-      float UnitTemp = Reading[static_cast<uint32_t>(Unit)];
-
-      AreaWeightedTemp += UnitTemp * UnitArea / TotalArea;
-    }
-
-    MaxReading = std::max(AreaWeightedTemp, MaxReading);
-  };
-
-  return MaxReading;
+  return AreaWeightedTemp / TotalArea;
 }
 
 ExtHotSpotTempInit readHotSpotTempInit(char const *FileName) {
@@ -599,8 +943,8 @@ ExtHotSpotTempInit readHotSpotTempInit(char const *FileName) {
 
       // UnitName could be prefixed by
       // nothing -> Unit
-      // hsp_ -> Heatspreader
       // iface_ -> Interface
+      // hsp_ -> Heatspreader
       // hsink_ -> Heatsink
 
       // And alternatively...
@@ -642,25 +986,37 @@ ExtHotSpotTempInit readHotSpotTempInit(char const *FileName) {
 ExtHotSpotFloorplan readHotSpotFloorplan(char const *FileName) {
   std::ifstream File(FileName);
 
-  ExtHotSpotFloorplan Floorplan;
+  ExtHotSpotFloorplan Floorplan{};
+  Floorplan.Units.resize(static_cast<std::size_t>(ExtHotSpotUnitName::__LAST) +
+                         1);
 
-  if (!File) {
+  if (!File.is_open()) {
     LLVM_DEBUG(errs() << "Failed to open file: " << FileName << "\n");
     return Floorplan;
   }
 
-  std::string Line;
+  std::string Line{};
   while (std::getline(File, Line)) {
+    // LLVM_DEBUG(dbgs() << "Got line: " << Line << "\n");
     std::vector<std::string> Parts = splitString(Line, "\n\t ");
 
     if (Parts.size() != 5) {
       // Possibly malformed; should warn (could also just be blank lines)
+      LLVM_DEBUG(errs() << "Got parts of size: " << Parts.size()
+                        << ", content was: [" << Line << "]\n");
     } else {
+      // LLVM_DEBUG(dbgs() << "Number of parts: " << Parts.size() << "\n");
+      // LLVM_DEBUG(dbgs() << "Got parts: UnitName: " << Parts[0] << "\n");
+      // LLVM_DEBUG(dbgs() << "Got parts: Left: " << Parts[1] << "\n");
+      // LLVM_DEBUG(dbgs() << "Got parts: Bottom: " << Parts[2] << "\n");
+      // LLVM_DEBUG(dbgs() << "Got parts: Width: " << Parts[3] << "\n");
+      // LLVM_DEBUG(dbgs() << "Got parts: Height: " << Parts[4] << "\n");
+
       std::string UnitName = Parts[0];
-      float Left = std::stof(Parts[1]);
-      float Bottom = std::stof(Parts[2]);
-      float Width = std::stof(Parts[3]);
-      float Height = std::stof(Parts[4]);
+      float Width = std::stof(Parts[1]);
+      float Height = std::stof(Parts[2]);
+      float Left = std::stof(Parts[3]);
+      float Bottom = std::stof(Parts[4]);
 
       ExtHotSpotUnitName UnitEnum = hotSpotStringToUnitName(UnitName);
       ExtHotSpotFlpUnit &Unit = Floorplan.Units.at(
@@ -680,10 +1036,19 @@ ExtHotSpotPowerInput
 mapMcPATPowerToHotspotPower(ExtMcPATOutput const &McPatPower,
                             ExtHotSpotFloorplan const &HotSpotFlp,
                             ExtConfigData const &Config) {
-  ExtHotSpotPowerInput HotSpotPower;
+  ExtHotSpotPowerInput HotSpotPower{};
+  HotSpotPower.UnitPower.resize(
+      static_cast<std::size_t>(ExtHotSpotUnitName::__LAST));
 
   // Floorplan is already scaled by McPAT area (by a python script, but its just
   // setup so acceptable?)
+
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::L2_LEFT) =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::L2_CACHE) / 3.0;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::L2_RIGHT) =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::L2_CACHE) / 3.0;
+  getPowerHotSpot(HotSpotPower, ExtHotSpotUnitName::L2) =
+      getPowerMcPAT(McPatPower, ExtMcPATUnitName::L2_CACHE) / 3.0;
 
   // TODO: L2 cache temperature
   // TODO: unused residuals
@@ -1100,6 +1465,12 @@ void ExtPathCollector::buildCriticalPath() {
     if (Index[v] == -1) {
       StronglyConnect(v);
     }
+  }
+
+  BlocksInComp.resize(CompCount);
+
+  for (uint32_t BlockID = 0; BlockID < N; BlockID++) {
+    BlocksInComp[CompIDs[BlockID]].push_back(BlockID);
   }
 
   LLVM_DEBUG(dbgs() << "Created SCCs, now computing costs\n");
@@ -2120,6 +2491,8 @@ char const *unitNameToString(ExtMcPATUnitName const Name) {
     return "Results Broadcast Bus";
   case ExtMcPATUnitName::UNDIFFERENTIATED_CORE:
     return "Undifferentiated Core";
+  case ExtMcPATUnitName::L2_CACHE:
+    return "L2";
   default:
     return "Unknown";
   };
@@ -2260,7 +2633,7 @@ ExtMcPatInput blockStatsToMcPAT(int Id, float Voltage, float ClockRateHz,
                                 int NodeSize,
                                 std::vector<ExtBBStats> const &BlockStats) {
 
-  ExtMcPatInput Input;
+  ExtMcPatInput Input{};
   Input.BlockID = Id;
   Input.NodeSize = NodeSize;
   Input.Voltage = Voltage;
@@ -2311,23 +2684,36 @@ ExtMcPatInput blockStatsToMcPAT(int Id, float Voltage, float ClockRateHz,
   return Input;
 }
 
-ExtMcPATOutput runMcPAT(std::string ProgramName, ExtMcPatInput const &Input) {
-  std::string FileName = programNameToMcPATFile(ProgramName, Input);
-  std::string OutFile = "./mcpat_out/" + ProgramName + "/" + FileName + ".xml";
-  std::string InFile =
-      "./mcpat_inputs/" + ProgramName + "/" + FileName + ".txt";
+ExtMcPATOutput runMcPAT(std::string ProgramName, ExtMcPatInput const &Input,
+                        ExtConfigData const &Config) {
 
-  if (std::filesystem::is_regular_file(OutFile)) {
+  std::string FileName = programNameToMcPATFile(ProgramName, Input);
+  std::string OutFile = "./mcpat_out/" + ProgramName + "/" + FileName + ".txt";
+  std::string InFile =
+      "./mcpat_inputs/" + ProgramName + "/" + FileName + ".xml";
+
+  LLVM_DEBUG(dbgs() << "Generating McPAT file for program " << ProgramName
+                    << " at " << InFile << " with name " << FileName << "\n");
+
+  // TODO: use cache later
+  if (Config.UseCachedPowerOutputs &&
+      std::filesystem::is_regular_file(OutFile)) {
     // Just read the file and return
     return populateExtraMcPATOutputFields(Input,
                                           readMcPATOutput(OutFile.c_str()));
   }
 
+  // Create folder for this file, in case it doesn't exist
+  std::filesystem::create_directories(std::string("./mcpat_inputs/") +
+                                      ProgramName + "/");
+  // Create the input file
+  createMcPATInputFile(InFile.c_str(), Input);
+
   // TODO: ideally command should just be running McPAT binary
   // TODO: even better; build McPAT as dll or statically link so we can just
   // call directly
   std::string Command =
-      "./run_mcpat_specific.sh " + ProgramName + " " + FileName;
+      "./run_mcpat_specific.sh " + FileName + " " + ProgramName;
 
   int Ret = std::system(Command.c_str());
 
@@ -2932,10 +3318,10 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
                     << "\n");
 
   const std::string MFName = MF.getName().str();
-  bool FunctionHasProfileData = MF.getFunction().hasProfileData();
-
-  LLVM_DEBUG(dbgs() << "Function " << MFName << ", has profile data: "
-                    << FunctionHasProfileData << "\n");
+  // bool FunctionHasProfileData = MF.getFunction().hasProfileData();
+  //
+  // LLVM_DEBUG(dbgs() << "Function " << MFName << ", has profile data: "
+  //                   << FunctionHasProfileData << "\n");
 
   PC.registerFunction(MFName);
 
@@ -3225,7 +3611,7 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
     LLVM_DEBUG(dbgs() << "Running our full analysis (in-path now)...\n");
 
     // TODO: read from file
-    ExtConfigData ConfigData = ExtConfigData{};
+    ExtConfigData ConfigData = readConfigData(CONFIG_NEW_PATH);
     ExtFinalAnalysisContext ETCRun = createAnalysisContext(PC);
     ExtFinalAnalysisContext BaselineRun = createAnalysisContext(PC);
 
@@ -3249,6 +3635,7 @@ static inline float percentChange(float Original, float New) {
 
 ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
                                     ExtHotSpotTempTrace const &TempTrace,
+                                    ExtHotSpotFloorplan const &Floorplan,
                                     ExtBBStats const &Stats) {
   ExtOutputStats Output;
   Output.Cycles = Stats.Cycles;
@@ -3263,12 +3650,22 @@ ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
   Output.EnergyDelayProduct = Output.Energy * Output.Time;
   Output.IPS = Output.Instructions / Output.Time;
 
+  Output.TimeWeightedTemp = areaWeightedCoreTemp(TempTrace, Floorplan);
+  Output.PeakTemp = peakTemp(TempTrace);
+
   return Output;
 }
 
 ExtOutputStats
 combineOutputStats(std::vector<ExtOutputStats> const &OutputStats) {
-  ExtOutputStats Output;
+  ExtOutputStats Output{};
+
+  if (OutputStats.size() == 0) {
+    LLVM_DEBUG(errs() << "Got no output stats in the end!\n");
+  } else {
+    LLVM_DEBUG(errs() << "Combining " << OutputStats.size()
+                      << " output stats\n");
+  }
 
   for (ExtOutputStats const &Stats : OutputStats) {
     Output.Cycles += Stats.Cycles;
@@ -3281,13 +3678,18 @@ combineOutputStats(std::vector<ExtOutputStats> const &OutputStats) {
     Output.Voltage += Stats.Voltage * Stats.Time;
     Output.IPS += Stats.IPS * Stats.Time;
     Output.Power += Stats.Power * Stats.Time;
+    Output.TimeWeightedTemp += Stats.TimeWeightedTemp * Stats.Time;
+
+    // Maximums
+    Output.PeakTemp = std::max(Output.PeakTemp, Stats.PeakTemp);
   }
 
   // Fix time-weighted averages
   Output.Frequency /= Output.Time;
   Output.Voltage /= Output.Time;
   Output.IPS /= Output.Time;
-  Output.Power /= Output.Power;
+  Output.Power /= Output.Time;
+  Output.TimeWeightedTemp /= Output.Time;
 
   // Calculate EDP
   Output.EnergyDelayProduct = Output.Energy * Output.Time;
@@ -3315,7 +3717,12 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
   //  - we can then either insert the required vf changes into those blocks, or
   //  insert additional header/ender blocks, find blocks that post/pre-dominate
   //  etc.
+
+  // TODO: don't duplicate, pass to runHotSpot
+  ExtHotSpotFloorplan Floorplan = readHotSpotFloorplan(HOTSPOT_FLOORPLAN_PATH);
+
   std::vector<std::vector<ExtSubgraphID>> SubgraphPredecessors;
+  SubgraphPredecessors.resize(Context.SubgraphAdjacencyList.size());
 
   for (ExtSubgraphID SubgraphA = 0;
        SubgraphA < Context.SubgraphAdjacencyList.size(); SubgraphA++) {
@@ -3327,7 +3734,6 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
   // Start by iterating in topological order
   for (ExtSubgraphID SubgraphID : Context.TopoSortedSubgraphs) {
     // Find heat (if exists)
-    // TODO: read from config
     float AssumedTemperature =
         celsiusToKelvin(Config.InitialTemperatureCelsius);
 
@@ -3343,11 +3749,20 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
     }
 
     // Calculate average of collected previous traces
-    ExtHotSpotTempTrace AverageTrace;
+    ExtHotSpotTempTrace AverageTrace{};
     if (Traces.size() > 0) {
-      AverageTrace = aggregateTracesAverage(Traces);
+      // TODO: allow switching between aggregates
+      AverageTrace = aggregateTracesHottest(Traces);
+
+      LLVM_DEBUG(dbgs() << "Aggregated " << Traces.size()
+                        << " traces, got weighted initial temperature: "
+                        << areaWeightedCoreTemp(AverageTrace, Floorplan)
+                        << "\n");
     } else {
       AverageTrace = initDefaultHotSpotTrace(AssumedTemperature);
+
+      LLVM_DEBUG(dbgs() << "Initialised to temperature " << AssumedTemperature
+                        << "\n");
     }
 
     std::vector<ExtVFPair> VFPairs = {};
@@ -3358,7 +3773,7 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
       Baseline.FrequencyHz = Config.BaselineFrequencyGHz * 1.0e9f;
       VFPairs = std::vector<ExtVFPair>({Baseline});
     } else {
-      VFPairs = teiGetVFVVCandidates(AssumedTemperature, Config);
+      VFPairs = teiGetCandidates(AssumedTemperature, Config);
     }
 
     ExtVFPair BestConfiguration = ExtVFPair{};
@@ -3371,8 +3786,8 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
           SubgraphID, VFPair.Voltage, VFPair.FrequencyHz, Config.NodeSize,
           std::vector<ExtBBStats>({SubgraphStats}));
 
-      ExtMcPATOutput Output =
-          runMcPAT(cleanModuleName(SubgraphStats.ModuleName.c_str()), Input);
+      ExtMcPATOutput Output = runMcPAT(
+          cleanModuleName(SubgraphStats.ModuleName.c_str()), Input, Config);
 
       // Run hotspot
       ExtHotSpotTempTrace OutputTemp =
@@ -3384,12 +3799,15 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
       // Check if temperature limits exceeded
       if (peakTemp(OutputTemp) > Config.MaximumTemperatureKelvin) {
         // Exclude candidate
+        LLVM_DEBUG(dbgs() << "Excluding candidate for being too hot, was "
+                          << peakTemp(OutputTemp) << " when safeguard is "
+                          << Config.MaximumTemperatureKelvin << "\n");
         continue;
       }
 
       // Calculate EDP
       ExtOutputStats OutputStats =
-          calculateOutputStats(Output, OutputTemp, SubgraphStats);
+          calculateOutputStats(Output, OutputTemp, Floorplan, SubgraphStats);
 
       if (OutputStats.EnergyDelayProduct < BestConfigurationEDP) {
         BestConfigurationEDP = OutputStats.EnergyDelayProduct;
@@ -3399,6 +3817,11 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
             std::make_optional(OutputTemp);
         Context.SubgraphOutputStats[SubgraphID] =
             std::make_optional(OutputStats);
+
+        LLVM_DEBUG(dbgs() << "Ran hotspot, time was " << OutputStats.Time
+                          << ", peak temperature " << OutputStats.PeakTemp
+                          << ", cycles executed " << OutputStats.Cycles
+                          << "\n");
       }
     }
   }
@@ -3430,6 +3853,9 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
     }
   }
 
+  // TODO: before combining output stats, we should also output the
+  // non-accumulated stats
+
   ExtOutputStats ETCFinalOutput = combineOutputStats(EtcOutput);
   ExtOutputStats BaselineFinalOutput = combineOutputStats(BaselineOutput);
 
@@ -3456,6 +3882,11 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
   File << "EDP%Improve:" << EDPImprovement << "\n";
   File << "IPS%Improve:" << IPSImprovement << "\n";
   File << "Energy%Improve:" << EnergyImprovement << "\n";
+  File << "PeakTempETC:" << ETCFinalOutput.PeakTemp << "\n";
+  File << "PeakTempBase:" << BaselineFinalOutput.PeakTemp << "\n";
+  File << "AvgTempETC:" << ETCFinalOutput.TimeWeightedTemp << "\n";
+  File << "AvgTempBase:" << BaselineFinalOutput.TimeWeightedTemp << "\n";
+  File << "TotalCycles:" << BaselineFinalOutput.Cycles << "\n";
 
   File.close();
 }
@@ -3544,6 +3975,14 @@ ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC) {
   // Build subgraph adjacency list from PC.DAGAdjacency
   Context.SubgraphAdjacencyList =
       std::vector<std::vector<ExtSubgraphID>>(PC.DisjointSubgraphBlocks.size());
+
+  uint32_t BlockCount = PC.BlockStats.size();
+  uint32_t ComponentCount = PC.BlocksInComp.size();
+  uint32_t SubgraphCount = PC.DisjointSubgraphBlocks.size();
+
+  LLVM_DEBUG(dbgs() << "Block count: " << BlockCount
+                    << ", Component count: " << ComponentCount
+                    << ", Subgraph count: " << SubgraphCount << "\n");
 
   // Need mapping component id -> subgraph
   // have subgraph -> list{component}
@@ -3661,30 +4100,32 @@ ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC) {
       if (SubgraphStats.ModuleName.size() == 0)
         SubgraphStats.ModuleName = Stats.ModuleName;
 
-      SubgraphStats.Cycles = Stats.Cycles * Stats.Freq;
+      SubgraphStats.Cycles += Stats.Cycles * Stats.Freq;
+      // TODO: accumulating doesn't make sense for this field, but it should be
+      // unused anyway
       SubgraphStats.Freq = Stats.Freq;
       SubgraphStats.GlobalFreq = Stats.GlobalFreq;
-      SubgraphStats.Loads = Stats.Loads * Stats.Freq;
-      SubgraphStats.Stores = Stats.Stores * Stats.Freq;
-      SubgraphStats.Spills = Stats.Spills * Stats.Freq;
-      SubgraphStats.Reloads = Stats.Reloads * Stats.Freq;
-      SubgraphStats.Reads = Stats.Reads * Stats.Freq;
-      SubgraphStats.Writes = Stats.Writes * Stats.Freq;
-      SubgraphStats.InstrCount = Stats.InstrCount * Stats.Freq;
-      SubgraphStats.IntInstrCount = Stats.IntInstrCount * Stats.Freq;
-      SubgraphStats.FloatInstrCount = Stats.FloatInstrCount * Stats.Freq;
-      SubgraphStats.BranchInstrCount = Stats.BranchInstrCount * Stats.Freq;
-      SubgraphStats.LoadStoreInstrCount =
+      SubgraphStats.Loads += Stats.Loads * Stats.Freq;
+      SubgraphStats.Stores += Stats.Stores * Stats.Freq;
+      SubgraphStats.Spills += Stats.Spills * Stats.Freq;
+      SubgraphStats.Reloads += Stats.Reloads * Stats.Freq;
+      SubgraphStats.Reads += Stats.Reads * Stats.Freq;
+      SubgraphStats.Writes += Stats.Writes * Stats.Freq;
+      SubgraphStats.InstrCount += Stats.InstrCount * Stats.Freq;
+      SubgraphStats.IntInstrCount += Stats.IntInstrCount * Stats.Freq;
+      SubgraphStats.FloatInstrCount += Stats.FloatInstrCount * Stats.Freq;
+      SubgraphStats.BranchInstrCount += Stats.BranchInstrCount * Stats.Freq;
+      SubgraphStats.LoadStoreInstrCount +=
           Stats.LoadStoreInstrCount * Stats.Freq;
-      SubgraphStats.FunctionCalls = Stats.FunctionCalls * Stats.Freq;
-      SubgraphStats.ContextSwitches = Stats.ContextSwitches * Stats.Freq;
-      SubgraphStats.MulAccess = Stats.MulAccess * Stats.Freq;
-      SubgraphStats.FPAccess = Stats.FPAccess * Stats.Freq;
-      SubgraphStats.IntALUAccess = Stats.IntALUAccess * Stats.Freq;
-      SubgraphStats.IntRegfileReads = Stats.IntRegfileReads * Stats.Freq;
-      SubgraphStats.FloatRegfileReads = Stats.FloatRegfileReads * Stats.Freq;
-      SubgraphStats.IntRegfileWrites = Stats.IntRegfileWrites * Stats.Freq;
-      SubgraphStats.FloatRegfileWrites = Stats.FloatRegfileWrites * Stats.Freq;
+      SubgraphStats.FunctionCalls += Stats.FunctionCalls * Stats.Freq;
+      SubgraphStats.ContextSwitches += Stats.ContextSwitches * Stats.Freq;
+      SubgraphStats.MulAccess += Stats.MulAccess * Stats.Freq;
+      SubgraphStats.FPAccess += Stats.FPAccess * Stats.Freq;
+      SubgraphStats.IntALUAccess += Stats.IntALUAccess * Stats.Freq;
+      SubgraphStats.IntRegfileReads += Stats.IntRegfileReads * Stats.Freq;
+      SubgraphStats.FloatRegfileReads += Stats.FloatRegfileReads * Stats.Freq;
+      SubgraphStats.IntRegfileWrites += Stats.IntRegfileWrites * Stats.Freq;
+      SubgraphStats.FloatRegfileWrites += Stats.FloatRegfileWrites * Stats.Freq;
     }
 
     Context.SubgraphStats.push_back(SubgraphStats);

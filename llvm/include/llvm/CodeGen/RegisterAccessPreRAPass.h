@@ -88,7 +88,6 @@ enum class ExtHotSpotUnitName : uint32_t {
   __LAST,
 };
 
-// TODO: add in L2 cache
 // TODO: add in bounds __FIRST and __LAST for iteration
 enum class ExtMcPATUnitName : uint32_t {
   PROCESSOR = 0,
@@ -124,6 +123,7 @@ enum class ExtMcPATUnitName : uint32_t {
   INTEGER_ALU,
   FLOATING_POINT_UNIT,
   RESULTS_BROADCAST_BUS,
+  L2_CACHE,
   UNDIFFERENTIATED_CORE // Must be max
 };
 
@@ -212,7 +212,6 @@ struct ExtMcPatInput {
 
 // TODO: read/write from cfg file
 struct ExtConfigData {
-  bool UseResiduals = false;
   int HeatsinkOffset = 0;
   // Assumes both are given in increasing order
   std::vector<float> FrequenciesGHz = {3.0f, 3.1f, 3.2f, 3.3f,
@@ -223,7 +222,19 @@ struct ExtConfigData {
   float VoltageAllowedError = 0.02f;
   float InitialTemperatureCelsius = 77.0f;
   int NodeSize = 14;
-  float MaximumTemperatureKelvin = 355.0f; // 82 degrees limit
+
+  float ColdVoltageAdjustment = 0.0f;
+  bool AdjustVoltageWhenCold = false;
+  float ColdTemperatureKelvin = 0.0f;
+  float MaximumTemperatureKelvin = 355.0f;
+  float MaximumFrequencyGHz = 3.8f;
+  // TODO: remove this one later
+  float FrequencyStepGHz = 0.1f;
+
+  bool UseCachedPowerOutputs = false;
+  bool VaryFrequency = false;
+
+  uint32_t NumSamplesHotSpot = 10;
 };
 
 // Just the properties we need to overwrite
@@ -280,6 +291,8 @@ struct ExtOutputStats {
   float Cycles;
   float Frequency;
   float Voltage;
+  float TimeWeightedTemp;
+  float PeakTemp;
 };
 
 struct ExtVFPair {
@@ -354,6 +367,7 @@ struct ExtBlockDVSInformation {
   float Frequency;
 };
 
+ExtConfigData readConfigData(char const *FileName);
 void performFullAnalysis(ExtFinalAnalysisContext &Context,
                          ExtConfigData const &Config, bool ForceBaseline);
 void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
@@ -368,6 +382,7 @@ void writeDVSInformation(std::vector<ExtBlockDVSInformation> const &Information,
                          ExtConfigData const &Config, char const *FileName);
 ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
                                     ExtHotSpotTempTrace const &TempTrace,
+                                    ExtHotSpotFloorplan const &Floorplan,
                                     ExtBBStats const &Stats);
 // Takes time-weighted averages of Frequency, Voltage, Power, IPS
 ExtOutputStats
@@ -375,10 +390,8 @@ combineOutputStats(std::vector<ExtOutputStats> const &OutputStats);
 
 float teiGetVoltage(float TempKelvin, float FrequencyHz);
 float teiVoltageToDiscreteLevel(float Voltage, ExtConfigData const &Config);
-std::vector<ExtVFPair> teiGetSFVVCandidates(float TempKelvin,
-                                            ExtConfigData const &Config);
-std::vector<ExtVFPair> teiGetVFVVCandidates(float TempKelvin,
-                                            ExtConfigData const &Config);
+std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
+                                        ExtConfigData const &Config);
 
 std::vector<std::string> splitString(std::string const &Str,
                                      std::string const &Delimiters);
@@ -392,7 +405,8 @@ void createMcPATInputFile(char const *FileName, ExtMcPatInput const &Input);
 ExtMcPATOutput readMcPATOutput(char const *FileName);
 std::string programNameToMcPATFile(std::string ProgramName,
                                    ExtMcPatInput const &Input);
-ExtMcPATOutput runMcPAT(std::string ProgramName, ExtMcPatInput const &Input);
+ExtMcPATOutput runMcPAT(std::string ProgramName, ExtMcPatInput const &Input,
+                        ExtConfigData const &Config);
 float getPowerMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name);
 float getAreaMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name);
 // Expects stats have already been multiplied out by Frequency
@@ -408,7 +422,6 @@ ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
                                ExtHotSpotTempTrace const &InitialTrace,
                                ExtConfigData const &Config);
 // TODO: take config for heatsink offset?
-void writeHotSpotTempInit(float InitialTemperature, char const *FileName);
 void writeHotSpotTempInit(ExtHotSpotTempTrace PreviousTrace,
                           char const *FileName);
 // TODO: nice if we had ExtHotSpotTempTrace, but then ExtHotSpotTempReading,
@@ -416,13 +429,18 @@ void writeHotSpotTempInit(ExtHotSpotTempTrace PreviousTrace,
 // ExtHotSpotTempReading
 ExtHotSpotTempTrace
 aggregateTracesAverage(std::vector<ExtHotSpotTempTrace> const &Traces);
+
+ExtHotSpotTempTrace
+aggregateTracesHottest(std::vector<ExtHotSpotTempTrace> const &Traces);
+
 // TODO: function that aggregates traces and outputs a single one based on
 // something
 float areaWeightedCoreTemp(ExtHotSpotTempTrace const &TempTrace,
                            ExtHotSpotFloorplan const &Flp);
 float peakTemp(ExtHotSpotTempTrace const &TempTrace);
 ExtHotSpotTempInit readHotSpotTempInit(char const *FileName);
-void writeHotSpotPowerTrace(ExtHotSpotPowerInput Power, char const *FileName);
+void writeHotSpotPowerTrace(ExtHotSpotPowerInput const &Power,
+                            ExtConfigData const &Config, char const *FileName);
 
 ExtHotSpotPowerInput
 mapMcPATPowerToHotspotPower(ExtMcPATOutput const &McPatPower,
