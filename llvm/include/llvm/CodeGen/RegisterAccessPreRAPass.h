@@ -288,6 +288,8 @@ struct ExtOutputStats {
   float EnergyDelayProduct;
   float IPS;
   float Instructions;
+  float FloatInstructions;
+  float IntInstructions;
   float Cycles;
   float Frequency;
   float Voltage;
@@ -370,6 +372,8 @@ struct ExtBlockDVSInformation {
 ExtConfigData readConfigData(char const *FileName);
 void performFullAnalysis(ExtFinalAnalysisContext &Context,
                          ExtConfigData const &Config, bool ForceBaseline);
+void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
+                         char const *FileName);
 void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
                                   ExtFinalAnalysisContext const &BaselineRun,
                                   ExtConfigData const &ConfigData,

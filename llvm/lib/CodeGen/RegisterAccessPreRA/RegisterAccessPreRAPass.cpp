@@ -43,6 +43,8 @@ using namespace llvm;
 
 namespace llvm {
 
+static constexpr char const *OUTPUT_SUBGRAPH_STATS_PATH =
+    "./PerSubgraphStats.csv";
 static constexpr char const *HOTSPOT_CONFIG_FILE_PATH =
     "./hotspot_files/example.config";
 static constexpr char const *HOTSPOT_GCC_INIT_PATH = "./hotspot_files/gcc.init";
@@ -912,6 +914,10 @@ float areaWeightedCoreTemp(ExtHotSpotTempTrace const &TempTrace,
     float UnitArea = getAreaHotSpotFlp(Flp, Unit);
     // Take the last temperature for each sample of the unit (TODO: customise so
     // we can average/max/latest)
+    if (TempTrace.Temps.at(static_cast<uint32_t>(Unit)).size() == 0) {
+      LLVM_DEBUG(errs() << "TempTrace at unit " << hotSpotUnitNameToString(Unit)
+                        << " was of size 0\n");
+    }
     float LatestTemp = TempTrace.Temps.at(static_cast<uint32_t>(Unit)).back();
 
     TotalArea += UnitArea;
@@ -3640,6 +3646,8 @@ ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
   ExtOutputStats Output;
   Output.Cycles = Stats.Cycles;
   Output.Instructions = Stats.InstrCount;
+  Output.FloatInstructions = Stats.FloatInstrCount;
+  Output.IntInstructions = Stats.IntInstrCount;
 
   Output.Frequency = McPAT.ClockRateHz;
   Output.Voltage = McPAT.Voltage;
@@ -3656,6 +3664,57 @@ ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
   return Output;
 }
 
+void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
+                         char const *FileName) {
+  std::ofstream File = std::ofstream(FileName);
+
+  if (!File.is_open()) {
+    LLVM_DEBUG(errs() << "Failed to open file for writing output stats: "
+                      << FileName << "\n");
+    return;
+  }
+
+  // CSV header
+  File << "SubgraphID,"
+       << "Energy,"
+       << "Time,"
+       << "Power,"
+       << "EnergyDelayProduct,"
+       << "IPS,"
+       << "Instructions,"
+       << "FloatInstructions,"
+       << "IntInstructions,"
+       << "Cycles,"
+       << "Frequency,"
+       << "Voltage,"
+       << "TimeWeightedTemp,"
+       << "PeakTemp" << '\n';
+
+  // The index of SubgraphOutputStats is the SubgraphID.
+  for (size_t SubgraphID = 0; SubgraphID < Context.SubgraphOutputStats.size();
+       ++SubgraphID) {
+
+    const std::optional<ExtOutputStats> &Stats =
+        Context.SubgraphOutputStats[SubgraphID];
+
+    // No output stats available for this subgraph.
+    if (!Stats.has_value()) {
+      LLVM_DEBUG(dbgs() << "Missing stats for subgraph ID: " << SubgraphID
+                        << "\n");
+      continue;
+    }
+
+    File << SubgraphID << ',' << Stats->Energy << ',' << Stats->Time << ','
+         << Stats->Power << ',' << Stats->EnergyDelayProduct << ','
+         << Stats->IPS << ',' << Stats->Instructions << ','
+         << Stats->FloatInstructions << ',' << Stats->IntInstructions << ','
+         << Stats->Cycles << ',' << Stats->Frequency << ',' << Stats->Voltage
+         << ',' << Stats->TimeWeightedTemp << ',' << Stats->PeakTemp << '\n';
+  }
+
+  File.close();
+}
+
 ExtOutputStats
 combineOutputStats(std::vector<ExtOutputStats> const &OutputStats) {
   ExtOutputStats Output{};
@@ -3670,6 +3729,9 @@ combineOutputStats(std::vector<ExtOutputStats> const &OutputStats) {
   for (ExtOutputStats const &Stats : OutputStats) {
     Output.Cycles += Stats.Cycles;
     Output.Instructions += Stats.Instructions;
+    Output.FloatInstructions += Stats.FloatInstructions;
+    Output.IntInstructions += Stats.IntInstructions;
+
     Output.Time += Stats.Time;
     Output.Energy += Stats.Energy;
 
@@ -3817,6 +3879,8 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
             std::make_optional(OutputTemp);
         Context.SubgraphOutputStats[SubgraphID] =
             std::make_optional(OutputStats);
+        Context.SubgraphBestVFPair[SubgraphID] =
+            std::make_optional(BestConfiguration);
 
         LLVM_DEBUG(dbgs() << "Ran hotspot, time was " << OutputStats.Time
                           << ", peak temperature " << OutputStats.PeakTemp
@@ -3830,6 +3894,7 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
   if (!ForceBaseline) {
     writeDVSInformation(getBlockDVSInformation(Context), Config,
                         DVS_INSERT_INFORMATION_PATH);
+    writeAllOutputStats(Context, OUTPUT_SUBGRAPH_STATS_PATH);
   }
 }
 
@@ -3877,7 +3942,7 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
     return;
   }
 
-  File << "#ProgramName: "
+  File << "ProgramName:"
        << cleanModuleName(ETCRun.BlockStats[0].ModuleName.c_str()) << "\n";
   File << "EDP%Improve:" << EDPImprovement << "\n";
   File << "IPS%Improve:" << IPSImprovement << "\n";
@@ -3898,6 +3963,8 @@ getBlockDVSInformation(ExtFinalAnalysisContext const &Context) {
   // Iterate each subgraph
   for (ExtSubgraphID Subgraph = 0; Subgraph < Context.SubgraphBlocks.size();
        Subgraph++) {
+    LLVM_DEBUG(dbgs() << "For getting block info, iterating subgraph ID: "
+                      << Subgraph << "\n");
     // Identify VF configuration applied
     std::optional<ExtVFPair> VFPairOpt = Context.SubgraphBestVFPair[Subgraph];
 
@@ -3905,10 +3972,15 @@ getBlockDVSInformation(ExtFinalAnalysisContext const &Context) {
       continue;
     }
 
+    LLVM_DEBUG(dbgs() << "For getting block info, got a non-null VFPair\n");
+
     ExtVFPair VFPair = *VFPairOpt;
 
     // Iterate blocks of subgraph
     for (ExtBlockID StartBlock : Context.SubgraphEntryBlocks[Subgraph]) {
+      LLVM_DEBUG(
+          dbgs()
+          << "Iterating a starting block now, and pushing into results\n");
       ExtBBStats Stats = Context.BlockStats[StartBlock];
 
       ExtBlockDVSInformation DVSInfo;
@@ -3916,8 +3988,13 @@ getBlockDVSInformation(ExtFinalAnalysisContext const &Context) {
       DVSInfo.Voltage = VFPair.Voltage;
       DVSInfo.BlockStats = Stats;
       DVSInfo.OutputStats = *Context.SubgraphOutputStats[Subgraph];
+
+      Result.push_back(DVSInfo);
     }
   }
+
+  LLVM_DEBUG(dbgs() << "[DVSBlockInfo] Returning results of size "
+                    << Result.size() << "\n");
 
   return Result;
 }
@@ -3947,12 +4024,17 @@ void writeDVSInformation(std::vector<ExtBlockDVSInformation> const &Information,
                          ExtConfigData const &Config, char const *FileName) {
   std::ofstream File = std::ofstream(FileName);
 
-  File << "function_name,local_block_id,voltage_level\n";
+  File << "function_name,local_block_id,voltage_level,voltage_value,frequency_"
+          "ghz\n";
+
+  LLVM_DEBUG(dbgs() << "Writing DVS information, writing " << Information.size()
+                    << " blocks\n");
 
   for (ExtBlockDVSInformation const &Block : Information) {
     File << Block.BlockStats.FunctionName << ","
          << Block.BlockStats.LocalBlockNumber << ","
-         << getVoltageIndex(Config, Block.Voltage) << "\n";
+         << getVoltageIndex(Config, Block.Voltage) << "," << Block.Voltage
+         << "," << Block.Frequency / 1.0e9f << "\n";
   }
 
   File.close();
@@ -3983,6 +4065,13 @@ ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC) {
   LLVM_DEBUG(dbgs() << "Block count: " << BlockCount
                     << ", Component count: " << ComponentCount
                     << ", Subgraph count: " << SubgraphCount << "\n");
+
+  // Count number of entry blocks for each subgraph (DEBUG)
+  for (ExtSubgraphID Id = 0; Id < SubgraphCount; Id++) {
+    LLVM_DEBUG(dbgs() << "Subgraph id " << Id << " has "
+                      << Context.SubgraphEntryBlocks[Id].size()
+                      << " entry blocks\n");
+  }
 
   // Need mapping component id -> subgraph
   // have subgraph -> list{component}
