@@ -368,6 +368,7 @@ struct ExtBlockDVSInformation {
   ExtOutputStats OutputStats;
   ExtBBStats BlockStats;
 
+  int PerformanceLevel;
   float Voltage;
   float Frequency;
 };

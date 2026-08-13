@@ -4121,6 +4121,34 @@ getBlockDVSInformation(ExtFinalAnalysisContext const &Context) {
     }
   }
 
+  std::sort(
+      Result.begin(), Result.end(),
+      [](ExtBlockDVSInformation const &A, ExtBlockDVSInformation const &B) {
+        if (A.Frequency == B.Frequency) {
+          return A.Voltage < B.Voltage;
+        }
+
+        return A.Frequency < B.Frequency;
+      });
+
+  // Assign each unique pair a new level
+  for (uint32_t i = 0; i < Result.size(); i++) {
+    ExtBlockDVSInformation &DVSInfo = Result[i];
+
+    if (i == 0) {
+      DVSInfo.PerformanceLevel = 0;
+    } else {
+      ExtBlockDVSInformation &Prev = Result[i - 1];
+
+      if (DVSInfo.Frequency == Prev.Frequency &&
+          DVSInfo.Voltage == Prev.Voltage) {
+        DVSInfo.PerformanceLevel = Prev.PerformanceLevel;
+      } else {
+        DVSInfo.PerformanceLevel = Prev.PerformanceLevel + 1;
+      }
+    }
+  }
+
   LLVM_DEBUG(dbgs() << "[DVSBlockInfo] Returning results of size "
                     << Result.size() << "\n");
 
@@ -4152,17 +4180,16 @@ void writeDVSInformation(std::vector<ExtBlockDVSInformation> const &Information,
                          ExtConfigData const &Config, char const *FileName) {
   std::ofstream File = std::ofstream(FileName);
 
-  File << "function_name,local_block_id,voltage_level,voltage_value,frequency_"
-          "ghz\n";
+  File << "function_name,local_block_id,performance_level,voltage_value,"
+          "frequency_ghz\n";
 
   LLVM_DEBUG(dbgs() << "Writing DVS information, writing " << Information.size()
                     << " blocks\n");
 
   for (ExtBlockDVSInformation const &Block : Information) {
     File << Block.BlockStats.FunctionName << ","
-         << Block.BlockStats.LocalBlockNumber << ","
-         << getVoltageIndex(Config, Block.Voltage) << "," << Block.Voltage
-         << "," << Block.Frequency / 1.0e9f << "\n";
+         << Block.BlockStats.LocalBlockNumber << "," << Block.PerformanceLevel
+         << "," << Block.Voltage << "," << Block.Frequency / 1.0e9f << "\n";
   }
 
   File.close();
