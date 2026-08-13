@@ -33,7 +33,7 @@ bool X86M5MarkerPass::runOnMachineFunction(MachineFunction &MF) {
   MachineRegisterInfo &MRI = MF.getRegInfo();
 
   // TODO: should just open this file once, not per-machine function, but
-  // probably insignificant cost anyway
+  // probably insignificant cost anyway.
   std::ifstream InputDVS("DVSInsertionData.csv");
   if (!InputDVS.is_open()) {
     errs() << "Failed to open DVS insertion data, skipping inserting DVS "
@@ -44,14 +44,18 @@ bool X86M5MarkerPass::runOnMachineFunction(MachineFunction &MF) {
   // TODO: can optimise to use string views/ranges instead
   std::unordered_map<int, uint32_t> BlockIDToDVS;
   std::string Line;
-  // Note block numbers are unique to the machine function, not global
+
+  // TODO: poor complexity; file (size proportional to number of blocks) is
+  // re-read for every machine function.
+  // Note block numbers are unique to the machine function, not global.
   while (std::getline(InputDVS, Line)) {
-    // TODO: explicitly deal with the first row, which should be column titles
+    // function_name,local_block_id,voltage_level,voltage_value,frequency_ghz.
+    // TODO: explicitly deal with the first row, which should be column titles.
     StringRef S(Line);
-    SmallVector<StringRef, 4> Fields;
+    SmallVector<StringRef, 8> Fields;
     S.split(Fields, ',');
 
-    if (Fields.size() != 3) {
+    if (Fields.size() != 5) {
       errs() << "Improper CSV format, expected 3 fields for DVS insertion "
                 "data, skipping row\n";
       continue;
@@ -59,10 +63,14 @@ bool X86M5MarkerPass::runOnMachineFunction(MachineFunction &MF) {
 
     StringRef MFName = Fields[0];
     StringRef BlockIDStr = Fields[1];
-    StringRef BlockVFLevelStr = Fields[2];
+    StringRef BlockVoltageLevelStr = Fields[2];
+    StringRef BlockVoltageValueStr = Fields[3];
+    StringRef BlockFrequencyGHzStr = Fields[4];
 
     int BlockID;
-    int BlockVFLevel;
+    int BlockVoltageLevel;
+    double BlockVoltageValue;
+    double BlockFrequencyGHz;
 
     if (BlockIDStr.getAsInteger(10, BlockID)) {
       errs()
@@ -72,8 +80,22 @@ bool X86M5MarkerPass::runOnMachineFunction(MachineFunction &MF) {
       continue;
     }
 
-    if (BlockVFLevelStr.getAsInteger(10, BlockVFLevel)) {
+    if (BlockVoltageLevelStr.getAsInteger(10, BlockVoltageLevel)) {
       errs() << "Failed to convert BlockVFLevel (Field index 2) to integer\n";
+
+      continue;
+    }
+
+    if (BlockVoltageValueStr.getAsDouble(BlockVoltageValue)) {
+      errs() << "Failed to convert BlockVoltageValue (Field index 3) to "
+                "integer\n";
+
+      continue;
+    }
+
+    if (BlockFrequencyGHzStr.getAsDouble(BlockFrequencyGHz)) {
+      errs() << "Failed to convert BlockFrequencyGHz (Field index 4) to "
+                "integer\n";
 
       continue;
     }
@@ -82,7 +104,7 @@ bool X86M5MarkerPass::runOnMachineFunction(MachineFunction &MF) {
       continue;
     }
 
-    BlockIDToDVS.insert({BlockID, static_cast<uint32_t>(BlockVFLevel)});
+    BlockIDToDVS.insert({BlockID, static_cast<uint32_t>(BlockVoltageLevel)});
   }
 
   LLVM_DEBUG(dbgs() << "[X86M5Marker] MachineFunction: " << MF.getName()
@@ -97,8 +119,57 @@ bool X86M5MarkerPass::runOnMachineFunction(MachineFunction &MF) {
                       << ", BlockVF: " << BlockVF << "\n");
   }
 
+  /*
+  DenseMap<MachineBasicBlock *, SmallVector<MachineBasicBlock *, 4>>
+  PredecessorMap;
+
+  for (MachineBasicBlock &MBB : MF) {
+    auto& SavedPreds = PredecessorMap[&MBB];
+
+    for (auto Pred : MBB.predecessors()) {
+      SavedPreds.push_back(Pred);
+    }
+  }
+
+  for (auto &[MBB, Preds] : PredecessorMap) {
+    for (MachineBasicBlock *Pred : Preds) {
+      // TODO: precondition only insert header if this is a high-frequency block
+      // TODO: insert required code for block here
+      auto NewMBB = InsertM5Marker(Pred, MBB);
+      Pred->ReplaceUsesOfBlockWith(&MBB, NewMBB);
+    }
+  }
+
+  MachineBasicBlock *NewMBB = MF.CreateMachineBasicBlock();
+
+  // NewMBB -> MBB.
+  MF.insert(MBB.getIterator(), NewMBB);
+
+  SmallVector<MachineBasicBlock *, 8> Preds(
+      MBB.predecessors().begin(), MBB.predecessors().end());
+
+  for (MachineBasicBlock *Pred : Preds)
+    Pred->ReplaceUsesOfBlockWith(&MBB, NewMBB);
+
+  // Add the new edge in the machine CFG.
+  NewMBB->addSuccessor(&MBB);
+
+  // Emit the actual x86 unconditional branch.
+  TII.insertBranch(
+      *NewMBB,
+      &MBB,
+      nullptr,
+      {},
+      DebugLoc());
+
+  return NewMBB;
+  */
+
+  // TODO: snapshot the blocks so we can insert a predecessor block where
+  // needed.
   for (MachineBasicBlock &MBB : MF) {
     LLVM_DEBUG(dbgs() << "  [X86M5Marker] MBB #" << MBB.getNumber() << "\n");
+    // Insert at start of the block.
     auto InsertPt = MBB.getFirstNonPHI();
 
     if (InsertPt == MBB.end()) {

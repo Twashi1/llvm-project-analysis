@@ -240,6 +240,7 @@ struct ExtConfigData {
 // Just the properties we need to overwrite
 struct ExtHotSpotConfig {
   float TimePerSample = 0.0f;
+  float ClockFreqHz = 0.0f;
 };
 
 // All units kelvin
@@ -295,6 +296,8 @@ struct ExtOutputStats {
   float Voltage;
   float TimeWeightedTemp;
   float PeakTemp;
+
+  ExtBlockID BlockID;
 };
 
 struct ExtVFPair {

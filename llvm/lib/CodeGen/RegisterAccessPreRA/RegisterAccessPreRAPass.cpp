@@ -6,6 +6,7 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetSchedule.h"
 #include "llvm/DebugInfo/CodeView/RecordSerialization.h"
+#include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Module.h"
@@ -222,6 +223,12 @@ ExtConfigData readConfigData(const char *FileName) {
       continue;
     }
 
+    if (Key == "VOLTAGE_ALLOWED_ERROR") {
+      Config.VoltageAllowedError = std::stof(Value);
+
+      continue;
+    }
+
     if (Key == "HEATSINK_OFFSET") {
       Config.HeatsinkOffset = std::stof(Value);
 
@@ -332,6 +339,7 @@ void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
 
   //\t\t-sampling_intvl \tnumber
   std::regex SamplingIntervalPattern(R"(\s*-sampling_intvl)");
+  std::regex BaseClockPattern(R"(\s*-base_proc_freq)");
 
   while (std::getline(ReadFile, Line)) {
     if (Line.size() == 0)
@@ -349,6 +357,16 @@ void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
 
       // Rewrite line
       Line = std::string("\t\t-sampling_intvl\t") + Oss.str();
+    }
+
+    if (std::regex_search(Line, BaseClockPattern)) {
+      float ClockFreqHz = Config.ClockFreqHz;
+
+      std::ostringstream Oss;
+      Oss << std::scientific << std::setprecision(6) << ClockFreqHz;
+
+      // Rewrite line
+      Line = std::string("\t\t-base_clock_freq\t") + Oss.str();
     }
 
     ConfigFileLines.push_back(Line);
@@ -401,10 +419,15 @@ std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
     UnfilteredResults.push_back(Pair);
   }
 
-  // Look through for TEI sweet spots briefly to eliminate
-  // Frequencies being sorted already makes this simpler
+  // TODO: we should not eliminate these frequencies, it restricts us in the
+  // number of configurations available when we have thermal problems
+
+  // Look through for TEI sweet spots briefly to eliminate.
+  // Frequencies being sorted already makes this simpler.
   float PreviousVoltage = FLT_MAX;
   std::vector<ExtVFPair> Results;
+
+  bool EliminateFrequencySweetSpots = false;
 
   for (uint32_t i = UnfilteredResults.size(); --i;) {
     ExtVFPair Candidate = UnfilteredResults[i];
@@ -413,7 +436,7 @@ std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
     // order) Candidate has higher or equal voltage, for lower frequency Hence
     // Candidate is at least worse than the previous pair; i.e. previous pair
     // was a TEI sweet spot Skip candidate
-    if (Candidate.Voltage >= PreviousVoltage) {
+    if (EliminateFrequencySweetSpots && Candidate.Voltage >= PreviousVoltage) {
       continue;
     }
 
@@ -585,6 +608,7 @@ ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
   ExtHotSpotConfig HotSpotConfig = ExtHotSpotConfig{};
   HotSpotConfig.TimePerSample =
       (Stats.Cycles / Power.ClockRateHz) / Config.NumSamplesHotSpot;
+  HotSpotConfig.ClockFreqHz = Power.ClockRateHz;
   editHotSpotConfig(HotSpotConfig, HOTSPOT_CONFIG_FILE_PATH);
 
   LLVM_DEBUG(dbgs() << "Edited hot spot config; sample time: "
@@ -3511,6 +3535,9 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
         }
       }
 
+      int NumIntegerOperands = 0;
+      int NumFloatOperands = 0;
+
       for (unsigned i = 0; i < MI.getNumOperands(); i++) {
         const MachineOperand &MO = MI.getOperand(i);
 
@@ -3553,12 +3580,34 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
           } else if (MO.isDef()) {
             BlockStat.IntRegfileWrites += 1.0;
           }
+
+          ++NumIntegerOperands;
         } else if (extIsProbablyFloatReg(R)) {
           if (MO.isUse()) {
             BlockStat.FloatRegfileReads += 1.0;
           } else if (MO.isDef()) {
             BlockStat.FloatRegfileWrites += 1.0;
           }
+
+          // If we didn't detect as floating/int earlier, but we have float
+          // operand, likely to be float instr?
+          if (!extIsProbablyFloatingInstruction(MI, TII) &&
+              !extIsProbablyIntegerInstruction(MI, TII)) {
+            BlockStat.FloatInstrCount += 1.0;
+          }
+
+          ++NumFloatOperands;
+        }
+      }
+
+      if (MI.getNumOperands() > 0) {
+        // Likely to be int instr
+        if (!extIsProbablyIntegerInstruction(MI, TII) &&
+            NumIntegerOperands == MI.getNumOperands()) {
+          BlockStat.IntInstrCount += 1.0;
+        } else if (!extIsProbablyFloatingInstruction(MI, TII) &&
+                   NumFloatOperands > 0) {
+          BlockStat.FloatInstrCount += 1.0;
         }
       }
     }
@@ -3660,6 +3709,16 @@ ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
 
   Output.TimeWeightedTemp = areaWeightedCoreTemp(TempTrace, Floorplan);
   Output.PeakTemp = peakTemp(TempTrace);
+
+  Output.BlockID = McPAT.BlockID;
+
+  if (Output.Instructions == 0) {
+    Output.Time = 0.0f;
+    Output.Energy = 0.0f;
+    Output.EnergyDelayProduct = 0.0f;
+    Output.IPS = 0.0f;
+    Output.Power = 0.0f;
+  }
 
   return Output;
 }
@@ -3840,6 +3899,8 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
 
     ExtVFPair BestConfiguration = ExtVFPair{};
     float BestConfigurationEDP = INFINITY;
+    bool BestViolatedThermalLimit = true;
+    float BestPeakTemp = INFINITY;
 
     for (ExtVFPair VFPair : VFPairs) {
       // Take sum of stats of this subgraph
@@ -3856,7 +3917,14 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
           runHotSpot(cleanModuleName(SubgraphStats.ModuleName.c_str()), Output,
                      SubgraphStats, AverageTrace, Config);
 
+      if (SubgraphStats.InstrCount == 0) {
+        OutputTemp = AverageTrace;
+      }
+
       Context.SubgraphHotSpotOutput[SubgraphID].push_back(OutputTemp);
+
+      bool ThermalLimitViolated = false;
+      float PeakTemp = peakTemp(OutputTemp);
 
       // Check if temperature limits exceeded
       if (peakTemp(OutputTemp) > Config.MaximumTemperatureKelvin) {
@@ -3864,16 +3932,29 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
         LLVM_DEBUG(dbgs() << "Excluding candidate for being too hot, was "
                           << peakTemp(OutputTemp) << " when safeguard is "
                           << Config.MaximumTemperatureKelvin << "\n");
-        continue;
+
+        ThermalLimitViolated = true;
       }
 
       // Calculate EDP
       ExtOutputStats OutputStats =
           calculateOutputStats(Output, OutputTemp, Floorplan, SubgraphStats);
 
-      if (OutputStats.EnergyDelayProduct < BestConfigurationEDP) {
+      bool IsCandidateBetter = false;
+
+      // If current cnadidate doesn't violate safety temperature, and our
+      // current best does, we must take the candidate
+      if (BestViolatedThermalLimit && (PeakTemp < BestPeakTemp)) {
+        IsCandidateBetter = true;
+      } else if (OutputStats.EnergyDelayProduct < BestConfigurationEDP) {
+        IsCandidateBetter = true;
+      }
+
+      if (IsCandidateBetter) {
         BestConfigurationEDP = OutputStats.EnergyDelayProduct;
         BestConfiguration = VFPair;
+        BestViolatedThermalLimit = ThermalLimitViolated;
+        BestPeakTemp = PeakTemp;
 
         Context.SubgraphHotSpotFinalTemp[SubgraphID] =
             std::make_optional(OutputTemp);
@@ -3903,20 +3984,67 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
                                   ExtConfigData const &ConfigData,
                                   char const *FileName) {
   // Get the output stats and combine
-  std::vector<ExtOutputStats> EtcOutput;
-  std::vector<ExtOutputStats> BaselineOutput;
+  std::vector<ExtOutputStats> EtcOutput{};
+  std::vector<ExtOutputStats> BaselineOutput{};
 
-  for (auto const &OutputStat : ETCRun.SubgraphOutputStats) {
-    if (OutputStat.has_value()) {
-      EtcOutput.push_back(*OutputStat);
-    }
-  }
+  // Compare only based on blocks that both have
+  std::vector<uint8_t> BlockComparisonMask{};
 
   for (auto const &OutputStat : BaselineRun.SubgraphOutputStats) {
     if (OutputStat.has_value()) {
+      // Ignore bad blocks
+      if (OutputStat->Instructions == 0) {
+        continue;
+      }
+
       BaselineOutput.push_back(*OutputStat);
+
+      LLVM_DEBUG(dbgs() << "Baseline block id: " << OutputStat->BlockID
+                        << "\n");
+
+      if (OutputStat->BlockID >= BlockComparisonMask.size()) {
+        BlockComparisonMask.resize(OutputStat->BlockID + 1, 0);
+      }
+
+      BlockComparisonMask[OutputStat->BlockID] += 1;
     }
   }
+
+  for (auto const &OutputStat : ETCRun.SubgraphOutputStats) {
+    if (OutputStat.has_value()) {
+      // Ignore bad blocks
+      if (OutputStat->Instructions == 0) {
+        continue;
+      }
+
+      EtcOutput.push_back(*OutputStat);
+
+      LLVM_DEBUG(dbgs() << "ETC block id: " << OutputStat->BlockID << "\n");
+
+      if (OutputStat->BlockID >= BlockComparisonMask.size()) {
+        BlockComparisonMask.resize(OutputStat->BlockID + 1, 0);
+      }
+
+      BlockComparisonMask[OutputStat->BlockID] += 1;
+    }
+  }
+
+  EtcOutput.erase(
+      std::remove_if(EtcOutput.begin(), EtcOutput.end(),
+                     [&](ExtOutputStats const &OutputStats) {
+                       return BlockComparisonMask[OutputStats.BlockID] != 2;
+                     }),
+      EtcOutput.end());
+
+  BaselineOutput.erase(
+      std::remove_if(BaselineOutput.begin(), BaselineOutput.end(),
+                     [&](ExtOutputStats const &OutputStats) {
+                       return BlockComparisonMask[OutputStats.BlockID] != 2;
+                     }),
+      BaselineOutput.end());
+
+  LLVM_DEBUG(dbgs() << "Evaluation runs on " << EtcOutput.size()
+                    << " blocks\n");
 
   // TODO: before combining output stats, we should also output the
   // non-accumulated stats
