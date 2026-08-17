@@ -44,8 +44,8 @@ using namespace llvm;
 
 namespace llvm {
 
-static constexpr char const *OUTPUT_SUBGRAPH_STATS_PATH =
-    "./PerSubgraphStats.csv";
+// static constexpr char const *OUTPUT_SUBGRAPH_STATS_PATH =
+//     "./PerSubgraphStats.csv";
 static constexpr char const *HOTSPOT_CONFIG_FILE_PATH =
     "./hotspot_files/example.config";
 static constexpr char const *HOTSPOT_GCC_INIT_PATH = "./hotspot_files/gcc.init";
@@ -55,10 +55,21 @@ static constexpr char const *HOTSPOT_POWER_TRACE_PATH =
     "./hotspot_files/gcc.ptrace";
 static constexpr char const *HOTSPOT_TEMP_TRACE_PATH =
     "./hotspot_files/outputs/gcc.ttrace";
-static constexpr char const *DVS_INSERT_INFORMATION_PATH =
-    "./DVSInsertionData.csv";
-static constexpr char const *EFFICIENCY_STATS_PATH = "./EfficiencyStatsNew.txt";
+// static constexpr char const *DVS_INSERT_INFORMATION_PATH =
+//     "./DVSInsertionData.csv";
+// static constexpr char const *EFFICIENCY_STATS_PATH =
+// "./EfficiencyStatsNew.txt";
 static constexpr char const *CONFIG_NEW_PATH = "./scripts/config_new.cfg";
+
+std::string pathDVSInsertionData(int BaselineIndex) {
+  return "./DVSInsertionData_b" + std::to_string(BaselineIndex) + ".csv";
+}
+std::string pathEfficiencyStats(int BaselineIndex) {
+  return "./EfficiencyStatsNew_b" + std::to_string(BaselineIndex) + ".txt";
+}
+std::string pathSubgraphStats(int BaselineIndex) {
+  return "./SubgraphStats_b" + std::to_string(BaselineIndex) + ".txt";
+}
 
 char RegisterAccessPreRAPass::ID = 0;
 unsigned RegisterAccessPreRAPass::Processed = 0;
@@ -209,14 +220,6 @@ ExtConfigData readConfigData(const char *FileName) {
     // Numerical values
     // TODO: some error-check on invalid values?
 
-    if (Key == "CLOCK_RATE_MHZ") {
-      const float ClockRateMHz = std::stof(Value);
-
-      Config.BaselineFrequencyGHz = ClockRateMHz / 1000.0f;
-
-      continue;
-    }
-
     if (Key == "NODE_SIZE") {
       Config.NodeSize = std::stoi(Value);
 
@@ -241,8 +244,8 @@ ExtConfigData readConfigData(const char *FileName) {
       continue;
     }
 
-    if (Key == "BASELINE_VOLTAGE_LEVEL") {
-      Config.BaselineVoltage = std::stof(Value);
+    if (Key == "TRANSITION_LATENCY_NS") {
+      Config.TransitionLatencyNs = static_cast<int>(std::stoul(Value));
 
       continue;
     }
@@ -265,23 +268,8 @@ ExtConfigData readConfigData(const char *FileName) {
       continue;
     }
 
-    if (Key == "FREQUENCY_STEP_GHZ") {
-      Config.FrequencyStepGHz = std::stof(Value);
-
-      continue;
-    }
-
-    if (Key == "FREQUENCY_LIMIT_GHZ") {
-      const float FrequencyLimitGHz = std::stof(Value);
-
-      // Store/use as required.
-      Config.MaximumFrequencyGHz = FrequencyLimitGHz;
-
-      continue;
-    }
-
     // Load up to 10 voltage values
-    if (Key.size() >= 2 && Key[0] == 'V') {
+    if (Key.size() >= 2 && Key[0] == 'V' && isdigit(Key[1])) {
       const unsigned Index = static_cast<unsigned>(std::stoul(Key.substr(1)));
 
       if (Index <= 10) {
@@ -296,17 +284,62 @@ ExtConfigData readConfigData(const char *FileName) {
       }
     }
 
+    // Load up to 10 frequency values
+    if (Key.size() >= 2 && Key[0] == 'F' && isdigit(Key[1])) {
+      const unsigned Index = static_cast<unsigned>(std::stoul(Key.substr(1)));
+
+      if (Index <= 10) {
+        float const FrequencyMHz = std::stof(Value);
+
+        if (Index >= Config.FrequenciesGHz.size())
+          Config.FrequenciesGHz.resize(Index + 1);
+
+        Config.FrequenciesGHz[Index] = FrequencyMHz / 1000.0f;
+
+        continue;
+      }
+    }
+
+    // Load up baselines
+    // Check if key string starts with "BASELINE_"
+    if (Key.size() >= 9 && Key.substr(0, strlen("BASELINE_")) == "BASELINE_") {
+      // Get the voltage level
+      std::string BaselineNumber = Key.substr(9);
+      // Expect baseline number to be (V|F)digit
+
+      if (BaselineNumber.size() != 2) {
+        LLVM_DEBUG(errs() << "Expected BASELINE_V0 or BASELINE_F0; where 0 can "
+                             "be any digit, but got ["
+                          << BaselineNumber << "]\n");
+
+        continue;
+      }
+
+      if (!isdigit(BaselineNumber[1])) {
+        LLVM_DEBUG(errs() << "Expected BASELINE_V0 or BASELINE_F0; where 0 is "
+                             "a digit, but was not digit ["
+                          << BaselineNumber << "]\n");
+
+        continue;
+      }
+
+      uint32_t Index = std::stoul(BaselineNumber.substr(1, 1));
+
+      if (Index >= Config.BaselineVoltages.size() ||
+          Index >= Config.BaselineFrequenciesGHz.size()) {
+        Config.BaselineVoltages.resize(Index + 1);
+        Config.BaselineFrequenciesGHz.resize(Index + 1);
+      }
+
+      if (BaselineNumber[0] == 'V') {
+        Config.BaselineVoltages[Index] = std::stof(Value);
+      } else if (BaselineNumber[0] == 'F') {
+        Config.BaselineFrequenciesGHz[Index] = std::stof(Value) / 1000.0f;
+      }
+    }
+
     LLVM_DEBUG(errs() << "Unknown configuration key on line " << LineNumber
                       << ": " << Key << "\n");
-  }
-
-  // Generate frequency list
-  Config.FrequenciesGHz.clear();
-
-  for (float Frequency = Config.BaselineFrequencyGHz;
-       Frequency <= Config.MaximumFrequencyGHz;
-       Frequency += Config.FrequencyStepGHz) {
-    Config.FrequenciesGHz.push_back(Frequency);
   }
 
   return Config;
@@ -392,8 +425,12 @@ void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
 }
 
 std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
-                                        ExtConfigData const &Config) {
+                                        ExtConfigData const &Config,
+                                        int BaselineIndex) {
   std::vector<ExtVFPair> UnfilteredResults;
+
+  float BaselineFrequencyGHz = Config.BaselineFrequenciesGHz[BaselineIndex];
+  float BaselineVoltage = Config.BaselineFrequenciesGHz[BaselineVoltage];
 
   for (uint32_t i = 0; i < Config.FrequenciesGHz.size(); i++) {
     float FrequencyHz = Config.FrequenciesGHz[i] * 1.0e9f;
@@ -411,9 +448,10 @@ std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
     Pair.FrequencyHz = FrequencyHz;
     Pair.Voltage = Voltage;
 
-    // If we're not allowed to vary frequency, set to baseline
+    // If we're not allowed to vary frequency, set to baseline (whichever one
+    // we're testing)
     if (!Config.VaryFrequency) {
-      Pair.FrequencyHz = Config.BaselineFrequencyGHz * 1.0e9f;
+      Pair.FrequencyHz = BaselineFrequencyGHz * 1.0e9f;
     }
 
     UnfilteredResults.push_back(Pair);
@@ -427,6 +465,10 @@ std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
   float PreviousVoltage = FLT_MAX;
   std::vector<ExtVFPair> Results;
 
+  // TODO: configuration option; drastically speeds up runs, but leads to us
+  // surpassing the thermal threshold more often
+  // TODO: consider an adaptive approach, where we only attempt non-sweet spot
+  // frequencies when temperature is exceeded
   bool EliminateFrequencySweetSpots = false;
 
   for (uint32_t i = UnfilteredResults.size(); --i;) {
@@ -1615,6 +1657,7 @@ void ExtPathCollector::buildCriticalPath() {
 
   LLVM_DEBUG(dbgs() << "]\n");
 
+  // TODO: move to configuration file
   const double SUBGRAPH_THRESHOLD = 1e6;
 
   // Find accumulated weight
@@ -3667,16 +3710,26 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
 
     // TODO: read from file
     ExtConfigData ConfigData = readConfigData(CONFIG_NEW_PATH);
-    ExtFinalAnalysisContext ETCRun = createAnalysisContext(PC);
-    ExtFinalAnalysisContext BaselineRun = createAnalysisContext(PC);
 
-    // Run with/without baseline
-    performFullAnalysis(ETCRun, ConfigData, false);
-    performFullAnalysis(BaselineRun, ConfigData, true);
+    if (ConfigData.BaselineFrequenciesGHz.size() == 0) {
+      LLVM_DEBUG(errs() << "Big error, didn't load any baselines!\n");
+    }
 
-    // Evaluate performance differences
-    evaluatePerformanceAndOutput(ETCRun, BaselineRun, ConfigData,
-                                 EFFICIENCY_STATS_PATH);
+    for (int BaselineIndex = 0;
+         BaselineIndex < ConfigData.BaselineFrequenciesGHz.size();
+         BaselineIndex++) {
+
+      ExtFinalAnalysisContext ETCRun = createAnalysisContext(PC);
+      ExtFinalAnalysisContext BaselineRun = createAnalysisContext(PC);
+
+      // Run with/without baseline
+      performFullAnalysis(ETCRun, ConfigData, BaselineIndex, false);
+      performFullAnalysis(BaselineRun, ConfigData, BaselineIndex, true);
+
+      // Evaluate performance differences
+      evaluatePerformanceAndOutput(ETCRun, BaselineRun, ConfigData,
+                                   pathEfficiencyStats(BaselineIndex));
+    }
   }
 
   return false;
@@ -3684,6 +3737,7 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
 
 // TODO: make constexpr
 static inline float celsiusToKelvin(float Celsius) { return Celsius + 273.15; }
+
 static inline float percentChange(float Original, float New) {
   return (New - Original) / Original * 100.0f;
 }
@@ -3691,6 +3745,7 @@ static inline float percentChange(float Original, float New) {
 ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
                                     ExtHotSpotTempTrace const &TempTrace,
                                     ExtHotSpotFloorplan const &Floorplan,
+                                    ExtConfigData const &Config,
                                     ExtBBStats const &Stats) {
   ExtOutputStats Output;
   Output.Cycles = Stats.Cycles;
@@ -3712,6 +3767,9 @@ ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
 
   Output.BlockID = McPAT.BlockID;
 
+  Output.DVSTransitions = Stats.Freq;
+  Output.TransitionCost = Stats.Freq * Config.TransitionLatencyNs * 1.0e-9;
+
   if (Output.Instructions == 0) {
     Output.Time = 0.0f;
     Output.Energy = 0.0f;
@@ -3724,7 +3782,7 @@ ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
 }
 
 void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
-                         char const *FileName) {
+                         std::string FileName) {
   std::ofstream File = std::ofstream(FileName);
 
   if (!File.is_open()) {
@@ -3747,6 +3805,8 @@ void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
        << "Frequency,"
        << "Voltage,"
        << "TimeWeightedTemp,"
+       << "TransitionCount,"
+       << "TransitionCost,"
        << "PeakTemp" << '\n';
 
   // The index of SubgraphOutputStats is the SubgraphID.
@@ -3768,7 +3828,8 @@ void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
          << Stats->IPS << ',' << Stats->Instructions << ','
          << Stats->FloatInstructions << ',' << Stats->IntInstructions << ','
          << Stats->Cycles << ',' << Stats->Frequency << ',' << Stats->Voltage
-         << ',' << Stats->TimeWeightedTemp << ',' << Stats->PeakTemp << '\n';
+         << ',' << Stats->TimeWeightedTemp << ',' << Stats->DVSTransitions
+         << ',' << Stats->TransitionCost << ',' << Stats->PeakTemp << '\n';
   }
 
   File.close();
@@ -3790,6 +3851,8 @@ combineOutputStats(std::vector<ExtOutputStats> const &OutputStats) {
     Output.Instructions += Stats.Instructions;
     Output.FloatInstructions += Stats.FloatInstructions;
     Output.IntInstructions += Stats.IntInstructions;
+    Output.DVSTransitions += Stats.DVSTransitions;
+    Output.TransitionCost += Stats.TransitionCost;
 
     Output.Time += Stats.Time;
     Output.Energy += Stats.Energy;
@@ -3819,7 +3882,8 @@ combineOutputStats(std::vector<ExtOutputStats> const &OutputStats) {
 }
 
 void performFullAnalysis(ExtFinalAnalysisContext &Context,
-                         ExtConfigData const &Config, bool ForceBaseline) {
+                         ExtConfigData const &Config, int BaselineIndex,
+                         bool ForceBaselineRun) {
   // We take as input
   // - the list of topologically sorted subgraphs
   // - for each candidate VF level
@@ -3830,14 +3894,15 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
   //  subgraphs
   //  - we find the heat data (assumed recorded), take an aggregate
   //  - we run hotspot, and record output heat data
-  //  - we loop if output heat data too hot (or if temperature violation found)
-  // - we finalise with the start, peak, and final temperature, vf configuration
-  // of each subgraph
+  //  - we loop if output heat data too hot (or if temperature violation
+  //  found)
+  // - we finalise with the start, peak, and final temperature, vf
+  // configuration of each subgraph
   //  - we output the required information to identify every start block, and
   //  every internal end block
-  //  - we can then either insert the required vf changes into those blocks, or
-  //  insert additional header/ender blocks, find blocks that post/pre-dominate
-  //  etc.
+  //  - we can then either insert the required vf changes into those blocks,
+  //  or insert additional header/ender blocks, find blocks that
+  //  post/pre-dominate etc.
 
   // TODO: don't duplicate, pass to runHotSpot
   ExtHotSpotFloorplan Floorplan = readHotSpotFloorplan(HOTSPOT_FLOORPLAN_PATH);
@@ -3888,13 +3953,14 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
 
     std::vector<ExtVFPair> VFPairs = {};
 
-    if (ForceBaseline) {
+    if (ForceBaselineRun) {
       ExtVFPair Baseline = ExtVFPair{};
-      Baseline.Voltage = Config.BaselineVoltage;
-      Baseline.FrequencyHz = Config.BaselineFrequencyGHz * 1.0e9f;
+      Baseline.Voltage = Config.BaselineVoltages[BaselineIndex];
+      Baseline.FrequencyHz =
+          Config.BaselineFrequenciesGHz[BaselineIndex] * 1.0e9f;
       VFPairs = std::vector<ExtVFPair>({Baseline});
     } else {
-      VFPairs = teiGetCandidates(AssumedTemperature, Config);
+      VFPairs = teiGetCandidates(AssumedTemperature, Config, BaselineIndex);
     }
 
     ExtVFPair BestConfiguration = ExtVFPair{};
@@ -3905,6 +3971,14 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
     for (ExtVFPair VFPair : VFPairs) {
       // Take sum of stats of this subgraph
       ExtBBStats SubgraphStats = Context.SubgraphStats[SubgraphID];
+
+      // If we're not on the baseline, consider the delay due to transitions
+      if (!ForceBaselineRun) {
+        float LatencyCost =
+            SubgraphStats.Freq * Config.TransitionLatencyNs * 1.0e-9;
+        SubgraphStats.Cycles += LatencyCost / VFPair.FrequencyHz;
+      }
+
       ExtMcPatInput Input = blockStatsToMcPAT(
           SubgraphID, VFPair.Voltage, VFPair.FrequencyHz, Config.NodeSize,
           std::vector<ExtBBStats>({SubgraphStats}));
@@ -3919,6 +3993,8 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
 
       if (SubgraphStats.InstrCount == 0) {
         OutputTemp = AverageTrace;
+        LLVM_DEBUG(errs() << "Bad subgraph found in VF selection, id: "
+                          << SubgraphID << "\n");
       }
 
       Context.SubgraphHotSpotOutput[SubgraphID].push_back(OutputTemp);
@@ -3937,8 +4013,8 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
       }
 
       // Calculate EDP
-      ExtOutputStats OutputStats =
-          calculateOutputStats(Output, OutputTemp, Floorplan, SubgraphStats);
+      ExtOutputStats OutputStats = calculateOutputStats(
+          Output, OutputTemp, Floorplan, Config, SubgraphStats);
 
       bool IsCandidateBetter = false;
 
@@ -3972,17 +4048,17 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
   }
 
   // Output selected DVS levels
-  if (!ForceBaseline) {
+  if (!ForceBaselineRun) {
     writeDVSInformation(getBlockDVSInformation(Context), Config,
-                        DVS_INSERT_INFORMATION_PATH);
-    writeAllOutputStats(Context, OUTPUT_SUBGRAPH_STATS_PATH);
+                        pathDVSInsertionData(BaselineIndex));
+    writeAllOutputStats(Context, pathSubgraphStats(BaselineIndex));
   }
 }
 
 void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
                                   ExtFinalAnalysisContext const &BaselineRun,
                                   ExtConfigData const &ConfigData,
-                                  char const *FileName) {
+                                  std::string FileName) {
   // Get the output stats and combine
   std::vector<ExtOutputStats> EtcOutput{};
   std::vector<ExtOutputStats> BaselineOutput{};
@@ -4079,6 +4155,14 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
   File << "PeakTempBase:" << BaselineFinalOutput.PeakTemp << "\n";
   File << "AvgTempETC:" << ETCFinalOutput.TimeWeightedTemp << "\n";
   File << "AvgTempBase:" << BaselineFinalOutput.TimeWeightedTemp << "\n";
+  File << "DVSTransitionsETC:" << ETCFinalOutput.DVSTransitions << "\n";
+  File << "TransitionCostETC:" << ETCFinalOutput.TransitionCost << "\n";
+  File << "BaselineEDP" << BaselineFinalOutput.EnergyDelayProduct << "\n";
+  File << "BaselineIPS" << BaselineFinalOutput.IPS << "\n";
+  File << "BaselineEnergy" << BaselineFinalOutput.Energy << "\n";
+  File << "EtcEDP" << ETCFinalOutput.EnergyDelayProduct << "\n";
+  File << "EtcIPS" << ETCFinalOutput.IPS << "\n";
+  File << "EtcEnergy" << ETCFinalOutput.Energy << "\n";
   File << "TotalCycles:" << BaselineFinalOutput.Cycles << "\n";
 
   File.close();
@@ -4177,7 +4261,7 @@ int getVoltageIndex(ExtConfigData const &Config, float Voltage) {
 }
 
 void writeDVSInformation(std::vector<ExtBlockDVSInformation> const &Information,
-                         ExtConfigData const &Config, char const *FileName) {
+                         ExtConfigData const &Config, std::string FileName) {
   std::ofstream File = std::ofstream(FileName);
 
   File << "function_name,local_block_id,performance_level,voltage_value,"
@@ -4315,8 +4399,8 @@ ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC) {
     }
   }
 
-  // Check if we have any remaining entries that weren't added, and add them in
-  // order
+  // Check if we have any remaining entries that weren't added, and add them
+  // in order
   for (ExtSubgraphID Subgraph = 0; Subgraph < DependencyCount.size();
        Subgraph++) {
     // Dependency was not fulfilled;
@@ -4345,8 +4429,8 @@ ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC) {
         SubgraphStats.ModuleName = Stats.ModuleName;
 
       SubgraphStats.Cycles += Stats.Cycles * Stats.Freq;
-      // TODO: accumulating doesn't make sense for this field, but it should be
-      // unused anyway
+      // TODO: accumulating doesn't make sense for this field, but it should
+      // be unused anyway
       SubgraphStats.Freq = Stats.Freq;
       SubgraphStats.GlobalFreq = Stats.GlobalFreq;
       SubgraphStats.Loads += Stats.Loads * Stats.Freq;

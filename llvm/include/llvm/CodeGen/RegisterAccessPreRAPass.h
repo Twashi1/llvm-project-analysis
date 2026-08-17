@@ -22,6 +22,11 @@ typedef unsigned ExtSubgraphID;
 typedef unsigned ExtComponentID;
 typedef unsigned ExtBlockID;
 
+struct ExtVFPair {
+  float FrequencyHz;
+  float Voltage;
+};
+
 struct ExtBBStats {
   double Cycles;
   double Freq;
@@ -214,11 +219,15 @@ struct ExtMcPatInput {
 struct ExtConfigData {
   int HeatsinkOffset = 0;
   // Assumes both are given in increasing order
-  std::vector<float> FrequenciesGHz = {3.0f, 3.1f, 3.2f, 3.3f,
-                                       3.4f, 3.5f, 3.6f};
-  std::vector<float> Voltages = {0.6f, 0.65f, 0.7f, 0.75f, 0.8f, 0.85f, 0.9f};
-  float BaselineVoltage = 0.8f;
-  float BaselineFrequencyGHz = 3.0f;
+  std::vector<float> FrequenciesGHz = {};
+  std::vector<float> Voltages = {};
+
+  // We expect a one-to-one correspondence between these vectors
+  // We test baselines consisting only of
+  // BaselineFrequenciesGHz[i], BaselineVoltages[i], i == i, i: 1..n
+  std::vector<float> BaselineFrequenciesGHz = {};
+  std::vector<float> BaselineVoltages = {};
+
   float VoltageAllowedError = 0.02f;
   float InitialTemperatureCelsius = 77.0f;
   int NodeSize = 14;
@@ -227,14 +236,13 @@ struct ExtConfigData {
   bool AdjustVoltageWhenCold = false;
   float ColdTemperatureKelvin = 0.0f;
   float MaximumTemperatureKelvin = 355.0f;
-  float MaximumFrequencyGHz = 3.8f;
-  // TODO: remove this one later
-  float FrequencyStepGHz = 0.1f;
 
   bool UseCachedPowerOutputs = false;
   bool VaryFrequency = false;
 
   uint32_t NumSamplesHotSpot = 10;
+
+  int TransitionLatencyNs = 50;
 };
 
 // Just the properties we need to overwrite
@@ -296,13 +304,10 @@ struct ExtOutputStats {
   float Voltage;
   float TimeWeightedTemp;
   float PeakTemp;
+  float DVSTransitions;
+  float TransitionCost;
 
   ExtBlockID BlockID;
-};
-
-struct ExtVFPair {
-  float FrequencyHz;
-  float Voltage;
 };
 
 struct ExtFinalAnalysisContext {
@@ -373,24 +378,30 @@ struct ExtBlockDVSInformation {
   float Frequency;
 };
 
+std::string pathDVSInsertionData(int BaselineIndex);
+std::string pathEfficiencyStats(int BaselineIndex);
+std::string pathSubgraphStats(int BaselineIndex);
+
 ExtConfigData readConfigData(char const *FileName);
 void performFullAnalysis(ExtFinalAnalysisContext &Context,
-                         ExtConfigData const &Config, bool ForceBaseline);
+                         ExtConfigData const &Config, int BaselineIndex,
+                         bool ForceBaselineRun);
 void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
-                         char const *FileName);
+                         std::string FileName);
 void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
                                   ExtFinalAnalysisContext const &BaselineRun,
                                   ExtConfigData const &ConfigData,
-                                  char const *FileName);
+                                  std::string FileName);
 int getVoltageIndex(ExtConfigData const &Config, float Voltage);
 std::string cleanModuleName(char const *ModuleName);
 std::vector<ExtBlockDVSInformation>
 getBlockDVSInformation(ExtFinalAnalysisContext const &Context);
 void writeDVSInformation(std::vector<ExtBlockDVSInformation> const &Information,
-                         ExtConfigData const &Config, char const *FileName);
+                         ExtConfigData const &Config, std::string FileName);
 ExtOutputStats calculateOutputStats(ExtMcPATOutput const &McPAT,
                                     ExtHotSpotTempTrace const &TempTrace,
                                     ExtHotSpotFloorplan const &Floorplan,
+                                    ExtConfigData const &Config,
                                     ExtBBStats const &Stats);
 // Takes time-weighted averages of Frequency, Voltage, Power, IPS
 ExtOutputStats
@@ -399,7 +410,8 @@ combineOutputStats(std::vector<ExtOutputStats> const &OutputStats);
 float teiGetVoltage(float TempKelvin, float FrequencyHz);
 float teiVoltageToDiscreteLevel(float Voltage, ExtConfigData const &Config);
 std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
-                                        ExtConfigData const &Config);
+                                        ExtConfigData const &Config,
+                                        int BaselineIndex);
 
 std::vector<std::string> splitString(std::string const &Str,
                                      std::string const &Delimiters);
