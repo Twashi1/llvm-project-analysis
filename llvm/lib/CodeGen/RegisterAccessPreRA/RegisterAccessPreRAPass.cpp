@@ -65,7 +65,7 @@ std::string pathEfficiencyStats(int BaselineIndex) {
   return "./EfficiencyStatsNew_b" + std::to_string(BaselineIndex) + ".txt";
 }
 std::string pathSubgraphStats(int BaselineIndex) {
-  return "./SubgraphStats_b" + std::to_string(BaselineIndex) + ".txt";
+  return "./SubgraphStats_b" + std::to_string(BaselineIndex) + ".csv";
 }
 
 char RegisterAccessPreRAPass::ID = 0;
@@ -4256,12 +4256,12 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
   File << "AvgTempBase:" << BaselineFinalOutput.TimeWeightedTemp << "\n";
   File << "DVSTransitionsETC:" << ETCFinalOutput.DVSTransitions << "\n";
   File << "TransitionCostETC:" << ETCFinalOutput.TransitionCost << "\n";
-  File << "BaselineEDP" << BaselineFinalOutput.EnergyDelayProduct << "\n";
-  File << "BaselineIPS" << BaselineFinalOutput.IPS << "\n";
-  File << "BaselineEnergy" << BaselineFinalOutput.Energy << "\n";
-  File << "EtcEDP" << ETCFinalOutput.EnergyDelayProduct << "\n";
-  File << "EtcIPS" << ETCFinalOutput.IPS << "\n";
-  File << "EtcEnergy" << ETCFinalOutput.Energy << "\n";
+  File << "BaselineEDP:" << BaselineFinalOutput.EnergyDelayProduct << "\n";
+  File << "BaselineIPS:" << BaselineFinalOutput.IPS << "\n";
+  File << "BaselineEnergy:" << BaselineFinalOutput.Energy << "\n";
+  File << "EtcEDP:" << ETCFinalOutput.EnergyDelayProduct << "\n";
+  File << "EtcIPS:" << ETCFinalOutput.IPS << "\n";
+  File << "EtcEnergy:" << ETCFinalOutput.Energy << "\n";
   File << "TotalCycles:" << BaselineFinalOutput.Cycles << "\n";
 
   File.close();
