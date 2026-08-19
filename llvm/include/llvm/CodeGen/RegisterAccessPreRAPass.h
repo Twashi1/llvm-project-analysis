@@ -378,6 +378,14 @@ struct ExtBlockDVSInformation {
   float Frequency;
 };
 
+struct ExtVFPairEvalResult {
+  ExtVFPair VFPair;
+  ExtHotSpotTempTrace OutputTemp;
+  ExtOutputStats OutputStats;
+  float PeakTemp;
+  bool ThermalLimitViolated;
+};
+
 std::string pathDVSInsertionData(int BaselineIndex);
 std::string pathEfficiencyStats(int BaselineIndex);
 std::string pathSubgraphStats(int BaselineIndex);
@@ -425,6 +433,14 @@ void createMcPATInputFile(char const *FileName, ExtMcPatInput const &Input);
 ExtMcPATOutput readMcPATOutput(char const *FileName);
 std::string programNameToMcPATFile(std::string ProgramName,
                                    ExtMcPatInput const &Input);
+std::string programNameToHotSpotConfigFile(std::string ProgramName,
+                                           ExtMcPATOutput const &Input);
+std::string programNameToHotSpotPowerFile(std::string ProgramName,
+                                          ExtMcPATOutput const &Input);
+std::string programNameToHotSpotOutTempsFile(std::string ProgramName,
+                                             ExtMcPATOutput const &Input);
+std::string programNameToHotSpotInitTempsFile(std::string ProgramName,
+                                              ExtMcPATOutput const &Input);
 ExtMcPATOutput runMcPAT(std::string ProgramName, ExtMcPatInput const &Input,
                         ExtConfigData const &Config);
 float getPowerMcPAT(ExtMcPATOutput const &Output, ExtMcPATUnitName Name);
@@ -467,7 +483,8 @@ mapMcPATPowerToHotspotPower(ExtMcPATOutput const &McPatPower,
                             ExtHotSpotFloorplan const &HotSpotFlp,
                             ExtConfigData const &Config);
 
-void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName);
+void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName,
+                       std::string OutputFile);
 
 bool extIsProbablyFloatingInstruction(const MachineInstr &MI,
                                       const TargetInstrInfo *TII);

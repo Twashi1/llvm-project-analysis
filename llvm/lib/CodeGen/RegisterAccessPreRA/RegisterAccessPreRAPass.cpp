@@ -14,6 +14,8 @@
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "llvm/PassRegistry.h"
@@ -48,13 +50,8 @@ namespace llvm {
 //     "./PerSubgraphStats.csv";
 static constexpr char const *HOTSPOT_CONFIG_FILE_PATH =
     "./hotspot_files/example.config";
-static constexpr char const *HOTSPOT_GCC_INIT_PATH = "./hotspot_files/gcc.init";
 static constexpr char const *HOTSPOT_FLOORPLAN_PATH =
     "./hotspot_files/out_flp.flp";
-static constexpr char const *HOTSPOT_POWER_TRACE_PATH =
-    "./hotspot_files/gcc.ptrace";
-static constexpr char const *HOTSPOT_TEMP_TRACE_PATH =
-    "./hotspot_files/outputs/gcc.ttrace";
 // static constexpr char const *DVS_INSERT_INFORMATION_PATH =
 //     "./DVSInsertionData.csv";
 // static constexpr char const *EFFICIENCY_STATS_PATH =
@@ -333,8 +330,14 @@ ExtConfigData readConfigData(const char *FileName) {
 
       if (BaselineNumber[0] == 'V') {
         Config.BaselineVoltages[Index] = std::stof(Value);
-      } else if (BaselineNumber[0] == 'F') {
+
+        continue;
+      }
+
+      if (BaselineNumber[0] == 'F') {
         Config.BaselineFrequenciesGHz[Index] = std::stof(Value) / 1000.0f;
+
+        continue;
       }
     }
 
@@ -358,7 +361,8 @@ std::string cleanModuleName(char const *ModuleName) {
   return {};
 }
 
-void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
+void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName,
+                       std::string OutputFile) {
   std::ifstream ReadFile = std::ifstream(FileName);
 
   if (!ReadFile.is_open()) {
@@ -408,8 +412,7 @@ void editHotSpotConfig(ExtHotSpotConfig const &Config, char const *FileName) {
   ReadFile.close();
 
   // Re-write back out to file
-  // TODO: could be much faster
-  std::ofstream WriteFile = std::ofstream(FileName);
+  std::ofstream WriteFile = std::ofstream(OutputFile);
 
   if (!WriteFile.is_open()) {
     LLVM_DEBUG(errs() << "Failed to open hot spot config file for writing at "
@@ -463,6 +466,7 @@ std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
   // Look through for TEI sweet spots briefly to eliminate.
   // Frequencies being sorted already makes this simpler.
   float PreviousVoltage = FLT_MAX;
+  float PreviousFrequency = FLT_MAX;
   std::vector<ExtVFPair> Results;
 
   // TODO: configuration option; drastically speeds up runs, but leads to us
@@ -482,7 +486,14 @@ std::vector<ExtVFPair> teiGetCandidates(float TempKelvin,
       continue;
     }
 
+    // Skip duplicates
+    if (Candidate.Voltage == PreviousVoltage &&
+        Candidate.FrequencyHz == PreviousFrequency) {
+      continue;
+    }
+
     PreviousVoltage = Candidate.Voltage;
+    PreviousFrequency = Candidate.FrequencyHz;
     Results.push_back(Candidate);
   }
 
@@ -647,11 +658,18 @@ ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
                                ExtConfigData const &Config) {
   LLVM_DEBUG(dbgs() << "Preparing to run hotspot on: " << ProgramName << "\n");
 
+  std::string ConfigFile = programNameToHotSpotConfigFile(ProgramName, Power);
+  std::string OutputFile = programNameToHotSpotOutTempsFile(ProgramName, Power);
+  std::string InputTempsFile =
+      programNameToHotSpotInitTempsFile(ProgramName, Power);
+  std::string PowerTraceFile =
+      programNameToHotSpotPowerFile(ProgramName, Power);
+
   ExtHotSpotConfig HotSpotConfig = ExtHotSpotConfig{};
   HotSpotConfig.TimePerSample =
       (Stats.Cycles / Power.ClockRateHz) / Config.NumSamplesHotSpot;
   HotSpotConfig.ClockFreqHz = Power.ClockRateHz;
-  editHotSpotConfig(HotSpotConfig, HOTSPOT_CONFIG_FILE_PATH);
+  editHotSpotConfig(HotSpotConfig, HOTSPOT_CONFIG_FILE_PATH, ConfigFile);
 
   LLVM_DEBUG(dbgs() << "Edited hot spot config; sample time: "
                     << HotSpotConfig.TimePerSample << "\n");
@@ -660,16 +678,23 @@ ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
 
   LLVM_DEBUG(dbgs() << "Read hot spot floorplan\n");
 
-  // Write gcc.init
-  writeHotSpotTempInit(InitialTrace, HOTSPOT_GCC_INIT_PATH);
+  // Write initial temperatures
+  writeHotSpotTempInit(InitialTrace, InputTempsFile.c_str());
   // Write gcc.ptrace
   ExtHotSpotPowerInput PowerInput =
       mapMcPATPowerToHotspotPower(Power, Floorplan, Config);
-  writeHotSpotPowerTrace(PowerInput, Config, HOTSPOT_POWER_TRACE_PATH);
+  writeHotSpotPowerTrace(PowerInput, Config, PowerTraceFile.c_str());
 
   // Run hotspot
   // TODO: system command for ./run_hotspot.sh true
-  std::string Command = "./run_hotspot.sh true";
+  // std::string Command = "./run_hotspot.sh true";
+  // TODO: implement new script
+  // TODO: do we have std::format? no?
+  std::string Command = "./run_hotspot_new.sh " + ConfigFile + " " +
+                        InputTempsFile + " " + PowerTraceFile + " " +
+                        OutputFile;
+
+  LLVM_DEBUG(dbgs() << "Invoking command: " << Command << "\n");
 
   int Ret = std::system(Command.c_str());
 
@@ -678,7 +703,7 @@ ExtHotSpotTempTrace runHotSpot(std::string ProgramName,
   }
 
   // Read output temperature trace
-  ExtHotSpotTempTrace TempTrace = readHotSpotTempTrace(HOTSPOT_TEMP_TRACE_PATH);
+  ExtHotSpotTempTrace TempTrace = readHotSpotTempTrace(OutputFile.c_str());
 
   return TempTrace;
 }
@@ -693,6 +718,12 @@ ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
     LLVM_DEBUG(errs() << "Failed to open file: " << FileName << "\n");
     return Trace;
   }
+
+  // TODO: just for debug
+  File.seekg(0, std::ios::end);
+  const auto FileSize = File.tellg();
+  File.seekg(0, std::ios::beg);
+  LLVM_DEBUG(dbgs() << "File size (hotspot output): " << FileSize << "\n");
 
   std::string Line;
   int LineNumber = 0;
@@ -740,7 +771,8 @@ ExtHotSpotTempTrace readHotSpotTempTrace(char const *FileName) {
     if (Reading.size() == 0) {
       LLVM_DEBUG(
           errs() << "HotSpot trace was missing reading values for unit index: "
-                 << UnitIndex << "\n");
+                 << UnitIndex << ", number of lines of file at time of read: "
+                 << LineNumber << "name given was: " << FileName << "\n");
     }
   }
 
@@ -2692,6 +2724,42 @@ std::string programNameToMcPATFile(std::string ProgramName,
          std::to_string(Input.BlockID);
 }
 
+std::string programNameToHotSpotConfigFile(std::string ProgramName,
+                                           ExtMcPATOutput const &Input) {
+  return "./hotspot_files/" + ProgramName + "__n" +
+         std::to_string(Input.NodeSize) + "_v" +
+         std::to_string(static_cast<int>(Input.Voltage * 1000.0f)) + "_f" +
+         std::to_string(static_cast<int>(Input.ClockRateHz * 1.0e-6)) + "_id" +
+         std::to_string(Input.BlockID) + ".config";
+}
+
+std::string programNameToHotSpotPowerFile(std::string ProgramName,
+                                          ExtMcPATOutput const &Input) {
+  return "./hotspot_files/" + ProgramName + "__n" +
+         std::to_string(Input.NodeSize) + "_v" +
+         std::to_string(static_cast<int>(Input.Voltage * 1000.0f)) + "_f" +
+         std::to_string(static_cast<int>(Input.ClockRateHz * 1.0e-6)) + "_id" +
+         std::to_string(Input.BlockID) + ".ptrace";
+}
+
+std::string programNameToHotSpotOutTempsFile(std::string ProgramName,
+                                             ExtMcPATOutput const &Input) {
+  return "./hotspot_files/outputs/" + ProgramName + "__n" +
+         std::to_string(Input.NodeSize) + "_v" +
+         std::to_string(static_cast<int>(Input.Voltage * 1000.0f)) + "_f" +
+         std::to_string(static_cast<int>(Input.ClockRateHz * 1.0e-6)) + "_id" +
+         std::to_string(Input.BlockID) + ".ttrace";
+}
+
+std::string programNameToHotSpotInitTempsFile(std::string ProgramName,
+                                              ExtMcPATOutput const &Input) {
+  return "./hotspot_files/" + ProgramName + "__n" +
+         std::to_string(Input.NodeSize) + "_v" +
+         std::to_string(static_cast<int>(Input.Voltage * 1000.0f)) + "_f" +
+         std::to_string(static_cast<int>(Input.ClockRateHz * 1.0e-6)) + "_id" +
+         std::to_string(Input.BlockID) + ".init";
+}
+
 static ExtMcPATOutput populateExtraMcPATOutputFields(ExtMcPatInput const &Input,
                                                      ExtMcPATOutput Output) {
   Output.BlockID = Input.BlockID;
@@ -3458,6 +3526,7 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
     BlockStat.InstrCount = 0.0;
     BlockStat.Loads = 0.0;
     BlockStat.Stores = 0.0;
+  https: // github.com/SamAinsworth/gem5-triangel/
     BlockStat.Reads = 0.0;
     BlockStat.Writes = 0.0;
     BlockStat.Reloads = 0.0;
@@ -3715,6 +3784,8 @@ bool RegisterAccessPreRAPass::runOnMachineFunction(MachineFunction &MF) {
       LLVM_DEBUG(errs() << "Big error, didn't load any baselines!\n");
     }
 
+    // TODO: run each baseline concurrently (potential for overlap when variable
+    // frequency mode)
     for (int BaselineIndex = 0;
          BaselineIndex < ConfigData.BaselineFrequenciesGHz.size();
          BaselineIndex++) {
@@ -3904,6 +3975,9 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
   //  or insert additional header/ender blocks, find blocks that
   //  post/pre-dominate etc.
 
+  // TODO: fix logging: need to collect logs in a per-worker string, and then we
+  // can print them sequentially at end
+
   // TODO: don't duplicate, pass to runHotSpot
   ExtHotSpotFloorplan Floorplan = readHotSpotFloorplan(HOTSPOT_FLOORPLAN_PATH);
 
@@ -3963,86 +4037,111 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
       VFPairs = teiGetCandidates(AssumedTemperature, Config, BaselineIndex);
     }
 
+    std::vector<ExtVFPairEvalResult> VFPairEvalResults;
+    VFPairEvalResults.resize(VFPairs.size());
+
+    // TODO: need to deal with Hotspot, it reads from the same files on each
+    // invocation, and outputs to the same
+    bool DisableConcurrency = false;
+
+    StdThreadPool Pool = StdThreadPool(llvm::hardware_concurrency());
+
+    for (size_t i = 0; i < VFPairs.size(); i++) {
+      ExtVFPair VFPair = VFPairs[i];
+
+      // Concurrently run each potential VF candidate
+      Pool.async([&, i, VFPair]() {
+        // Take sum of stats of this subgraph
+        ExtBBStats SubgraphStats = Context.SubgraphStats[SubgraphID];
+
+        // If we're not on the baseline, consider the delay due to transitions
+        if (!ForceBaselineRun) {
+          float LatencyCost =
+              SubgraphStats.Freq * Config.TransitionLatencyNs * 1.0e-9;
+          SubgraphStats.Cycles += LatencyCost / VFPair.FrequencyHz;
+        }
+
+        ExtMcPatInput Input = blockStatsToMcPAT(
+            SubgraphID, VFPair.Voltage, VFPair.FrequencyHz, Config.NodeSize,
+            std::vector<ExtBBStats>({SubgraphStats}));
+
+        ExtMcPATOutput Output = runMcPAT(
+            cleanModuleName(SubgraphStats.ModuleName.c_str()), Input, Config);
+
+        // Run hotspot
+        ExtHotSpotTempTrace OutputTemp =
+            runHotSpot(cleanModuleName(SubgraphStats.ModuleName.c_str()),
+                       Output, SubgraphStats, AverageTrace, Config);
+
+        if (SubgraphStats.InstrCount == 0) {
+          OutputTemp = AverageTrace;
+          LLVM_DEBUG(errs() << "Bad subgraph found in VF selection, id: "
+                            << SubgraphID << "\n");
+        }
+
+        // TODO: never read from? also no reasonable use case?
+        // Context.SubgraphHotSpotOutput[SubgraphID].push_back(OutputTemp);
+
+        float PeakTemp = peakTemp(OutputTemp);
+        bool ThermalLimitViolated = PeakTemp > Config.MaximumTemperatureKelvin;
+
+        // Calculate EDP
+        ExtOutputStats OutputStats = calculateOutputStats(
+            Output, OutputTemp, Floorplan, Config, SubgraphStats);
+
+        ExtVFPairEvalResult VFPairEvalResult;
+        VFPairEvalResult.VFPair = VFPair;
+        VFPairEvalResult.OutputTemp = OutputTemp;
+        VFPairEvalResult.OutputStats = OutputStats;
+        VFPairEvalResult.PeakTemp = PeakTemp;
+        VFPairEvalResult.ThermalLimitViolated = ThermalLimitViolated;
+
+        VFPairEvalResults[i] = VFPairEvalResult;
+      });
+
+      if (DisableConcurrency)
+        Pool.wait();
+    }
+
+    Pool.wait();
+
+    // Selection occurs synchronously (fast)
     ExtVFPair BestConfiguration = ExtVFPair{};
     float BestConfigurationEDP = INFINITY;
     bool BestViolatedThermalLimit = true;
     float BestPeakTemp = INFINITY;
 
-    for (ExtVFPair VFPair : VFPairs) {
-      // Take sum of stats of this subgraph
-      ExtBBStats SubgraphStats = Context.SubgraphStats[SubgraphID];
-
-      // If we're not on the baseline, consider the delay due to transitions
-      if (!ForceBaselineRun) {
-        float LatencyCost =
-            SubgraphStats.Freq * Config.TransitionLatencyNs * 1.0e-9;
-        SubgraphStats.Cycles += LatencyCost / VFPair.FrequencyHz;
-      }
-
-      ExtMcPatInput Input = blockStatsToMcPAT(
-          SubgraphID, VFPair.Voltage, VFPair.FrequencyHz, Config.NodeSize,
-          std::vector<ExtBBStats>({SubgraphStats}));
-
-      ExtMcPATOutput Output = runMcPAT(
-          cleanModuleName(SubgraphStats.ModuleName.c_str()), Input, Config);
-
-      // Run hotspot
-      ExtHotSpotTempTrace OutputTemp =
-          runHotSpot(cleanModuleName(SubgraphStats.ModuleName.c_str()), Output,
-                     SubgraphStats, AverageTrace, Config);
-
-      if (SubgraphStats.InstrCount == 0) {
-        OutputTemp = AverageTrace;
-        LLVM_DEBUG(errs() << "Bad subgraph found in VF selection, id: "
-                          << SubgraphID << "\n");
-      }
-
-      Context.SubgraphHotSpotOutput[SubgraphID].push_back(OutputTemp);
-
-      bool ThermalLimitViolated = false;
-      float PeakTemp = peakTemp(OutputTemp);
-
-      // Check if temperature limits exceeded
-      if (peakTemp(OutputTemp) > Config.MaximumTemperatureKelvin) {
-        // Exclude candidate
-        LLVM_DEBUG(dbgs() << "Excluding candidate for being too hot, was "
-                          << peakTemp(OutputTemp) << " when safeguard is "
-                          << Config.MaximumTemperatureKelvin << "\n");
-
-        ThermalLimitViolated = true;
-      }
-
-      // Calculate EDP
-      ExtOutputStats OutputStats = calculateOutputStats(
-          Output, OutputTemp, Floorplan, Config, SubgraphStats);
+    for (size_t i = 0; i < VFPairs.size(); i++) {
+      ExtVFPair VFPair = VFPairs[i];
+      ExtVFPairEvalResult Result = VFPairEvalResults[i];
 
       bool IsCandidateBetter = false;
 
       // If current cnadidate doesn't violate safety temperature, and our
       // current best does, we must take the candidate
-      if (BestViolatedThermalLimit && (PeakTemp < BestPeakTemp)) {
+      if (BestViolatedThermalLimit && (Result.PeakTemp < BestPeakTemp)) {
         IsCandidateBetter = true;
-      } else if (OutputStats.EnergyDelayProduct < BestConfigurationEDP) {
+      } else if (Result.OutputStats.EnergyDelayProduct < BestConfigurationEDP) {
         IsCandidateBetter = true;
       }
 
       if (IsCandidateBetter) {
-        BestConfigurationEDP = OutputStats.EnergyDelayProduct;
+        BestConfigurationEDP = Result.OutputStats.EnergyDelayProduct;
         BestConfiguration = VFPair;
-        BestViolatedThermalLimit = ThermalLimitViolated;
-        BestPeakTemp = PeakTemp;
+        BestViolatedThermalLimit = Result.ThermalLimitViolated;
+        BestPeakTemp = Result.PeakTemp;
 
         Context.SubgraphHotSpotFinalTemp[SubgraphID] =
-            std::make_optional(OutputTemp);
+            std::make_optional(Result.OutputTemp);
         Context.SubgraphOutputStats[SubgraphID] =
-            std::make_optional(OutputStats);
+            std::make_optional(Result.OutputStats);
         Context.SubgraphBestVFPair[SubgraphID] =
             std::make_optional(BestConfiguration);
 
-        LLVM_DEBUG(dbgs() << "Ran hotspot, time was " << OutputStats.Time
-                          << ", peak temperature " << OutputStats.PeakTemp
-                          << ", cycles executed " << OutputStats.Cycles
-                          << "\n");
+        LLVM_DEBUG(dbgs() << "Ran hotspot, time was " << Result.OutputStats.Time
+                          << ", peak temperature "
+                          << Result.OutputStats.PeakTemp << ", cycles executed "
+                          << Result.OutputStats.Cycles << "\n");
       }
     }
   }
