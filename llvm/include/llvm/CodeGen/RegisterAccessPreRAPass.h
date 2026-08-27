@@ -269,9 +269,6 @@ struct ExtHotSpotTempTrace {
   std::vector<std::vector<float>> Temps;
 };
 
-// TODO: mapping from McPATOutputData to ExtHotSpotPowerInput
-// TODO: writing this to a file, running hotspot, and parsing the output
-// TODO: in the step above, also need to read, modify, and write the config file
 struct ExtHotSpotPowerInput {
   // Total timespan; will be divied by number of samples
   float Timespan;
@@ -308,6 +305,25 @@ struct ExtOutputStats {
   float TransitionCost;
 
   ExtBlockID BlockID;
+};
+
+struct ExtBlockDVSInformation {
+  ExtOutputStats OutputStats;
+  ExtBBStats BlockStats;
+
+  int PerformanceLevel;
+  float Voltage;
+  float Frequency;
+  float DeltaWeightedTemp;
+};
+
+struct ExtVFPairEvalResult {
+  ExtVFPair VFPair;
+  ExtHotSpotTempTrace OutputTemp;
+  ExtOutputStats OutputStats;
+  float PeakTemp;
+  bool ThermalLimitViolated;
+  float DeltaWeightedTemp;
 };
 
 struct ExtFinalAnalysisContext {
@@ -366,24 +382,8 @@ struct ExtFinalAnalysisContext {
       SubgraphHotSpotFinalTemp; // The final temperature of a subgraph given
                                 // whatever VF level was selected
   std::vector<std::optional<ExtVFPair>> SubgraphBestVFPair;
+  std::vector<std::optional<ExtVFPairEvalResult>> SubgraphVFPairEvalResults;
   std::vector<std::optional<ExtOutputStats>> SubgraphOutputStats;
-};
-
-struct ExtBlockDVSInformation {
-  ExtOutputStats OutputStats;
-  ExtBBStats BlockStats;
-
-  int PerformanceLevel;
-  float Voltage;
-  float Frequency;
-};
-
-struct ExtVFPairEvalResult {
-  ExtVFPair VFPair;
-  ExtHotSpotTempTrace OutputTemp;
-  ExtOutputStats OutputStats;
-  float PeakTemp;
-  bool ThermalLimitViolated;
 };
 
 std::string pathDVSInsertionData(int BaselineIndex);

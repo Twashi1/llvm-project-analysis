@@ -235,6 +235,10 @@ ExtConfigData readConfigData(const char *FileName) {
       continue;
     }
 
+    if (Key == "INITIAL_TEMPERATURE") {
+      Config.InitialTemperatureCelsius = std::stof(Value) - 273.15;
+    }
+
     if (Key == "NUM_SAMPLES_HOTSPOT") {
       Config.NumSamplesHotSpot = static_cast<uint32_t>(std::stoul(Value));
 
@@ -3878,6 +3882,7 @@ void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
        << "TimeWeightedTemp,"
        << "TransitionCount,"
        << "TransitionCost,"
+       << "TempDelta,"
        << "PeakTemp" << '\n';
 
   // The index of SubgraphOutputStats is the SubgraphID.
@@ -3894,13 +3899,26 @@ void writeAllOutputStats(ExtFinalAnalysisContext const &Context,
       continue;
     }
 
+    const std::optional<ExtVFPairEvalResult> &VFPairEvalResult =
+        Context.SubgraphVFPairEvalResults[SubgraphID];
+
+    float DeltaWeightedTemp = 0.0f;
+
+    if (!VFPairEvalResult.has_value()) {
+      LLVM_DEBUG(dbgs() << "Missing VFPairEvalResult for subgraph ID: "
+                        << SubgraphID << "\n");
+    } else {
+      DeltaWeightedTemp = VFPairEvalResult->DeltaWeightedTemp;
+    }
+
     File << SubgraphID << ',' << Stats->Energy << ',' << Stats->Time << ','
          << Stats->Power << ',' << Stats->EnergyDelayProduct << ','
          << Stats->IPS << ',' << Stats->Instructions << ','
          << Stats->FloatInstructions << ',' << Stats->IntInstructions << ','
          << Stats->Cycles << ',' << Stats->Frequency << ',' << Stats->Voltage
          << ',' << Stats->TimeWeightedTemp << ',' << Stats->DVSTransitions
-         << ',' << Stats->TransitionCost << ',' << Stats->PeakTemp << '\n';
+         << ',' << Stats->TransitionCost << ',' << DeltaWeightedTemp << ','
+         << Stats->PeakTemp << '\n';
   }
 
   File.close();
@@ -4058,7 +4076,7 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
         if (!ForceBaselineRun) {
           float LatencyCost =
               SubgraphStats.Freq * Config.TransitionLatencyNs * 1.0e-9;
-          SubgraphStats.Cycles += LatencyCost / VFPair.FrequencyHz;
+          SubgraphStats.Cycles += LatencyCost * VFPair.FrequencyHz;
         }
 
         ExtMcPatInput Input = blockStatsToMcPAT(
@@ -4085,6 +4103,9 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
         float PeakTemp = peakTemp(OutputTemp);
         bool ThermalLimitViolated = PeakTemp > Config.MaximumTemperatureKelvin;
 
+        float DeltaWeightedTemp = areaWeightedCoreTemp(OutputTemp, Floorplan) -
+                                  areaWeightedCoreTemp(AverageTrace, Floorplan);
+
         // Calculate EDP
         ExtOutputStats OutputStats = calculateOutputStats(
             Output, OutputTemp, Floorplan, Config, SubgraphStats);
@@ -4095,6 +4116,7 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
         VFPairEvalResult.OutputStats = OutputStats;
         VFPairEvalResult.PeakTemp = PeakTemp;
         VFPairEvalResult.ThermalLimitViolated = ThermalLimitViolated;
+        VFPairEvalResult.DeltaWeightedTemp = DeltaWeightedTemp;
 
         VFPairEvalResults[i] = VFPairEvalResult;
       });
@@ -4137,6 +4159,8 @@ void performFullAnalysis(ExtFinalAnalysisContext &Context,
             std::make_optional(Result.OutputStats);
         Context.SubgraphBestVFPair[SubgraphID] =
             std::make_optional(BestConfiguration);
+        Context.SubgraphVFPairEvalResults[SubgraphID] =
+            std::make_optional(Result);
 
         LLVM_DEBUG(dbgs() << "Ran hotspot, time was " << Result.OutputStats.Time
                           << ", peak temperature "
@@ -4237,6 +4261,18 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
   float EnergyImprovement =
       -percentChange(BaselineFinalOutput.Energy, ETCFinalOutput.Energy);
 
+  // Compare IPS of ETC, and IPS of ETC - TransitionCost
+  float IPSSlowdownFromTransitions =
+      -percentChange(ETCFinalOutput.Instructions /
+                         (ETCFinalOutput.Time - ETCFinalOutput.TransitionCost),
+                     ETCFinalOutput.IPS);
+
+  float PercentTimeInTransitions =
+      ETCFinalOutput.TransitionCost / ETCFinalOutput.Time * 100.0f;
+
+  float TransitionsPerSecond =
+      ETCFinalOutput.DVSTransitions / ETCFinalOutput.Time;
+
   std::ofstream File = std::ofstream(FileName);
 
   if (!File.is_open()) {
@@ -4249,6 +4285,9 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
        << cleanModuleName(ETCRun.BlockStats[0].ModuleName.c_str()) << "\n";
   File << "EDP%Improve:" << EDPImprovement << "\n";
   File << "IPS%Improve:" << IPSImprovement << "\n";
+  File << "IPS%%SlowFromTransitions:" << IPSSlowdownFromTransitions << "\n";
+  File << "PercentTimeSpentInTransitions:" << PercentTimeInTransitions << "\n";
+  File << "TransitionsPerSecond:" << TransitionsPerSecond << "\n";
   File << "Energy%Improve:" << EnergyImprovement << "\n";
   File << "PeakTempETC:" << ETCFinalOutput.PeakTemp << "\n";
   File << "PeakTempBase:" << BaselineFinalOutput.PeakTemp << "\n";
@@ -4263,6 +4302,7 @@ void evaluatePerformanceAndOutput(ExtFinalAnalysisContext const &ETCRun,
   File << "EtcIPS:" << ETCFinalOutput.IPS << "\n";
   File << "EtcEnergy:" << ETCFinalOutput.Energy << "\n";
   File << "TotalCycles:" << BaselineFinalOutput.Cycles << "\n";
+  File << "TotalTime:" << ETCFinalOutput.Time << "\n";
 
   File.close();
 }
@@ -4299,6 +4339,8 @@ getBlockDVSInformation(ExtFinalAnalysisContext const &Context) {
       DVSInfo.Voltage = VFPair.Voltage;
       DVSInfo.BlockStats = Stats;
       DVSInfo.OutputStats = *Context.SubgraphOutputStats[Subgraph];
+      DVSInfo.DeltaWeightedTemp =
+          Context.SubgraphVFPairEvalResults[Subgraph]->DeltaWeightedTemp;
 
       Result.push_back(DVSInfo);
     }
@@ -4314,6 +4356,7 @@ getBlockDVSInformation(ExtFinalAnalysisContext const &Context) {
         return A.Frequency < B.Frequency;
       });
 
+  // TODO: needs to be on a per-run level, set in config
   // Assign each unique pair a new level
   for (uint32_t i = 0; i < Result.size(); i++) {
     ExtBlockDVSInformation &DVSInfo = Result[i];
@@ -4391,6 +4434,7 @@ ExtFinalAnalysisContext createAnalysisContext(ExtPathCollector const &PC) {
   Context.SubgraphHotSpotFinalTemp.resize(PC.DisjointSubgraphBlocks.size());
   Context.SubgraphBestVFPair.resize(PC.DisjointSubgraphBlocks.size());
   Context.SubgraphOutputStats.resize(PC.DisjointSubgraphBlocks.size());
+  Context.SubgraphVFPairEvalResults.resize(PC.DisjointSubgraphBlocks.size());
 
   // Build subgraph adjacency list from PC.DAGAdjacency
   Context.SubgraphAdjacencyList =
